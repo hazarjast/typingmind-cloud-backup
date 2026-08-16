@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-16.2";
+const TCS_BUILD_VERSION = "2026-08-16.3";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -1906,9 +1906,31 @@ if (window.typingMindCloudSync) {
   // ─────────────────────────────────────────────────────────────────────────
   class S3Service extends IStorageProvider {
     constructor(configManager, cryptoService, logger) {
-      super(configManager, cryptoService, logger);
+      super(
+        configManager,
+        cryptoService,
+        logger
+      );
+
       this.client = null;
       this.sdkLoaded = false;
+
+      const endpoint = String(
+        configManager.get("endpoint") || ""
+      );
+
+      /*
+       * Backblaze B2 currently returns HTTP 501 for S3 conditional PUT
+       * headers. Avoid sending known-unsupported requests on every metadata
+       * upload and lease heartbeat.
+       *
+       * Other S3-compatible providers begin in the unknown state and are
+       * detected on first use.
+       */
+      this.conditionalWritesSupported =
+        /backblazeb2\.com/i.test(endpoint)
+          ? false
+          : null;
     }
 
     static get displayName() {
@@ -2155,8 +2177,32 @@ if (window.typingMindCloudSync) {
         ifNoneMatch = false,
       } = options;
 
+      /*
+       * Return a synthetic unsupported error without making another network
+       * request after capability detection—or immediately for known
+       * Backblaze B2 endpoints.
+       *
+       * Callers already catch this error and use their safe fallback.
+       */
+      if (
+        this.conditionalWritesSupported === false
+      ) {
+        const unsupportedError =
+          new Error(
+            "S3 endpoint does not support conditional writes"
+          );
+
+        unsupportedError.code =
+          "ConditionalWriteUnsupported";
+
+        unsupportedError.statusCode = 501;
+
+        throw unsupportedError;
+      }
+
       const params = {
-        Bucket: this.config.get("bucketName"),
+        Bucket:
+          this.config.get("bucketName"),
         Key: key,
         Body: JSON.stringify(data),
         ContentType: "application/json",
@@ -2173,9 +2219,17 @@ if (window.typingMindCloudSync) {
       }
 
       try {
-        const result = await this.client
-          .putObject(params)
-          .promise();
+        const result =
+          await this.client
+            .putObject(params)
+            .promise();
+
+        /*
+         * At least one conditional request succeeded, so remember that this
+         * provider supports the feature for the remainder of the session.
+         */
+        this.conditionalWritesSupported =
+          true;
 
         this.logger.log(
           "success",
@@ -2190,8 +2244,32 @@ if (window.typingMindCloudSync) {
         return result;
       } catch (error) {
         if (
-          !isConditionalWriteConflict(error) &&
-          !isConditionalWriteUnsupported(error)
+          isConditionalWriteUnsupported(error)
+        ) {
+          /*
+           * Do not probe again for every metadata update or every lease
+           * heartbeat.
+           */
+          this.conditionalWritesSupported =
+            false;
+
+          const unsupportedError =
+            new Error(
+              "S3 endpoint does not support conditional writes"
+            );
+
+          unsupportedError.code =
+            "ConditionalWriteUnsupported";
+
+          unsupportedError.statusCode = 501;
+          unsupportedError.originalError =
+            error;
+
+          throw unsupportedError;
+        }
+
+        if (
+          !isConditionalWriteConflict(error)
         ) {
           this.logger.log(
             "error",
@@ -5635,6 +5713,10 @@ async download(key, isMetadata = false) {
 
       this.activeDailyBackupLease = null;
       this.dailyLeaseHeartbeatTimer = null;
+
+      this.conditionalLeaseWarningShown =
+        false;
+
       this.dailyLeaseUpdateChain =
         Promise.resolve();
 
@@ -5831,11 +5913,18 @@ async download(key, isMetadata = false) {
           throw error;
         }
 
-        this.logger.log(
-          "warning",
-          "Conditional cloud lease writes are unavailable. " +
-            "Using write/read ownership verification."
-        );
+        if (
+          !this.conditionalLeaseWarningShown
+        ) {
+          this.conditionalLeaseWarningShown =
+            true;
+
+          this.logger.log(
+            "warning",
+            "Conditional cloud lease writes are unavailable. " +
+              "Using write/read ownership verification."
+          );
+        }
 
         const result =
           await this.storageService.upload(
@@ -7837,6 +7926,9 @@ async download(key, isMetadata = false) {
       this._dailyBackupRunning = false;
       this.activeDailyBackupLease = null;
       this.lastDailyLeaseVerificationAt = 0;
+      this.conditionalLeaseWarningShown =
+        false;
+
       this.dailyLeaseUpdateChain =
         Promise.resolve();
     }
