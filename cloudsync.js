@@ -163,7 +163,7 @@ if (window.typingMindCloudSync) {
     loadConfig() {
       const defaults = {
         storageType: "s3",
-        syncInterval: 15,
+        syncInterval: 60,
         bucketName: "",
         region: "",
         accessKey: "",
@@ -212,7 +212,10 @@ if (window.typingMindCloudSync) {
         }
 
         if (value !== null) {
-          stored[key] = key === "syncInterval" ? parseInt(value) || 15 : value;
+          stored[key] =
+            key === "syncInterval"
+              ? Math.max(parseInt(value, 10) || 60, 60)
+              : value;
         }
       });
       return { ...defaults, ...stored };
@@ -3290,11 +3293,20 @@ async download(key, isMetadata = false) {
              itemLastModified = now;
             }
           } else {
-            currentSize =
-  value instanceof Uint8Array || value instanceof Blob
-    ? (value.size || value.length)
-    : this.getItemSize(value);
-            itemLastModified = existingItem?.lastModified || 0;
+            if (value instanceof Blob) {
+              currentSize = value.size;
+            } else if (value instanceof Uint8Array) {
+              currentSize = value.byteLength;
+            } else if (ArrayBuffer.isView(value)) {
+              currentSize = value.byteLength;
+            } else if (value instanceof ArrayBuffer) {
+              currentSize = value.byteLength;
+            } else {
+              currentSize = this.getItemSize(value);
+            }
+
+            itemLastModified =
+              existingItem?.lastModified || 0;
 
             if (!existingItem) {
               hasChanged = true;
@@ -4238,14 +4250,42 @@ async download(key, isMetadata = false) {
                     );
                   }
                   const syncTime = Date.now();
+
+                  let restoredSize;
+
+                  if (cloudItem.type === "blob") {
+                    restoredSize =
+                      cloudItem.size ??
+                      data.byteLength ??
+                      data.length ??
+                      0;
+                  } else {
+                    restoredSize =
+                      cloudItem.size ??
+                      this.getItemSize(data);
+                  }
+
                   this.metadata.items[cloudItemId] = {
-                    synced: syncTime,
+                    synced:
+                      cloudItem.synced || syncTime,
                     type: cloudItem.type,
-                    size: cloudItem.size || this.getItemSize(data),
-                    lastModified: syncTime,
+                    size: restoredSize,
+                    lastModified:
+                      cloudItem.lastModified || syncTime,
                   };
-                  if (cloudItem.type === "blob" && cloudItem.blobType) {
-                    this.metadata.items[cloudItemId].blobType = cloudItem.blobType;
+
+                  if (cloudItem.blobType) {
+                    this.metadata.items[
+                      cloudItemId
+                    ].blobType =
+                      cloudItem.blobType;
+                  }
+
+                  if (cloudItem.chatFingerprint) {
+                    this.metadata.items[
+                      cloudItemId
+                    ].chatFingerprint =
+                      cloudItem.chatFingerprint;
                   }
                   restoredCount++;
                   this.logger.log(
@@ -4788,23 +4828,21 @@ async download(key, isMetadata = false) {
           `[Force Import] Found ${cloudKeys.size} items in cloud and ${localKeys.size} items locally.`
         );
 
+        /*
+         * Calculate local deletions now, but do not perform them until every
+         * cloud item has downloaded and saved successfully.
+         */
         const keysToDelete = [...localKeys].filter(
           (key) => !cloudKeys.has(key)
         );
+
         if (keysToDelete.length > 0) {
           this.logger.log(
-            "start",
-            `[Force Import] Deleting ${keysToDelete.length} extraneous local items...`
+            "info",
+            `[Force Import] ${keysToDelete.length} extraneous local ` +
+              `item(s) will be deleted only after all cloud items ` +
+              `download successfully.`
           );
-          const deletePromises = [];
-          for (const key of keysToDelete) {
-            const item = (await this.dataService.getItem(key, "idb"))
-              ? { type: "idb" }
-              : { type: "ls" };
-            deletePromises.push(this.dataService.performDelete(key, item.type));
-          }
-          await Promise.allSettled(deletePromises);
-          this.logger.log("success", "[Force Import] Local cleanup complete.");
         }
 
         this.logger.log(
@@ -4876,10 +4914,74 @@ async download(key, isMetadata = false) {
         if (importFailCount > 0) {
           throw new Error(
             `Force Import stopped because ${importFailCount} of ` +
+        if (importFailCount > 0) {
+          throw new Error(
+            `Force Import stopped because ${importFailCount} of ` +
               `${importSuccessCount + importFailCount} cloud items failed ` +
-              `to download or save. Local metadata was not replaced.`
+              `to download or save. Extraneous local items were not deleted, ` +
+              `and local metadata was not replaced.`
           );
         }
+
+        /*
+         * All cloud objects downloaded and saved successfully. It is now
+         * safe to remove local items that are not present in cloud metadata.
+         */
+        if (keysToDelete.length > 0) {
+          this.logger.log(
+            "start",
+            `[Force Import] Deleting ${keysToDelete.length} ` +
+              `extraneous local item(s)...`
+          );
+
+          const deleteFailures = [];
+
+          for (const key of keysToDelete) {
+            let type = "ls";
+
+            const indexedDbValue =
+              await this.dataService.getItem(key, "idb");
+
+            if (indexedDbValue !== null) {
+              /*
+               * Blobs and ordinary IndexedDB values are stored in the same
+               * IndexedDB object store. performDelete handles both through
+               * the IndexedDB deletion path.
+               */
+              type =
+                indexedDbValue instanceof Blob
+                  ? "blob"
+                  : "idb";
+            }
+
+            const deleted =
+              await this.dataService.performDelete(
+                key,
+                type
+              );
+
+            if (!deleted) {
+              deleteFailures.push(key);
+            }
+
+            await yieldIfInputPending();
+          }
+
+          if (deleteFailures.length > 0) {
+            throw new Error(
+              `Force Import downloaded all cloud items, but failed to ` +
+                `delete ${deleteFailures.length} extraneous local item(s). ` +
+                `First failed key: ${deleteFailures[0]}`
+            );
+          }
+
+          this.logger.log(
+            "success",
+            `[Force Import] Deleted ${keysToDelete.length} ` +
+              `extraneous local item(s).`
+          );
+        }
+
         this.logger.log(
           "success",
           `[Force Import] ${importSuccessCount} cloud items applied locally.`
@@ -7136,7 +7238,7 @@ async download(key, isMetadata = false) {
               <div class="flex space-x-4">
                 <div class="w-1/2">
                   <label for="sync-interval" class="block text-sm font-medium text-zinc-300">Sync Interval (sec)</label>
-                  <input id="sync-interval" name="sync-interval" type="number" min="15" value="${this.config.get(
+                  <input id="sync-interval" name="sync-interval" type="number" min="60" value="${this.config.get(
                     "syncInterval"
                   )}" class="w-full px-2 py-1.5 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm dark:bg-zinc-700 text-white" autocomplete="off" required>
                 </div>
@@ -7392,35 +7494,115 @@ async download(key, isMetadata = false) {
           return;
         }
 
-        this.logger.log("start", `Permanently deleting item: ${itemId}`);
+        this.logger.log(
+          "start",
+          `Permanently deleting stored payload: ${itemId}`
+        );
+
         deleteButton.disabled = true;
+
         try {
           const item =
             this.syncOrchestrator.metadata.items[itemId];
 
+          if (!item?.deleted) {
+            throw new Error(
+              `Tombstone metadata was not found for "${itemId}"`
+            );
+          }
+
           const cloudPath =
-            item?.type === "blob"
+            item.type === "blob"
               ? `attachments/${itemId}.bin`
               : `items/${itemId}.json`;
 
+          /*
+           * Delete the encrypted payload, but retain a tombstone in cloud
+           * metadata. Removing the tombstone immediately could allow another
+           * device with an old local copy to upload and resurrect the item.
+           */
           await this.storageService.delete(cloudPath);
 
-          const tombstoneKey =
-            `tcs_tombstone_${itemId}`;
+          const cloudMetadata =
+            await this.syncOrchestrator.getCloudMetadata();
 
-          localStorage.removeItem(tombstoneKey);
-          delete this.syncOrchestrator.metadata.items[itemId];
-          await this.syncOrchestrator.performFullSync();
+          const deletionTime = Date.now();
 
-          this.logger.log("success", `Permanently deleted ${itemId}`);
+          const retainedTombstone = {
+            ...(cloudMetadata.items?.[itemId] || item),
+            deleted: item.deleted || deletionTime,
+            deletedAt:
+              item.deletedAt ||
+              item.deleted ||
+              deletionTime,
+            type: item.type,
+            tombstoneVersion:
+              item.tombstoneVersion || 1,
+            synced: deletionTime,
+            payloadDeleted: true,
+            payloadDeletedAt: deletionTime,
+          };
+
+          if (!cloudMetadata.items) {
+            cloudMetadata.items = {};
+          }
+
+          cloudMetadata.items[itemId] = {
+            ...retainedTombstone,
+          };
+
+          cloudMetadata.lastSync = deletionTime;
+
+          await this.storageService.upload(
+            "metadata.json",
+            cloudMetadata,
+            true
+          );
+
+          this.syncOrchestrator.metadata.items[itemId] = {
+            ...retainedTombstone,
+          };
+
+          this.syncOrchestrator.metadata.lastSync =
+            deletionTime;
+
+          this.syncOrchestrator.setLastCloudSync(
+            deletionTime
+          );
+
+          this.syncOrchestrator.saveMetadata();
+
+          this.dataService.saveTombstoneToStorage(
+            itemId,
+            retainedTombstone
+          );
+
+          /*
+           * The prior ETag no longer represents metadata.json after our
+           * direct upload.
+           */
+          localStorage.removeItem("tcs_metadata_etag");
+
+          this.logger.log(
+            "success",
+            `Permanently deleted the stored payload for ${itemId}. ` +
+              `The deletion marker will remain temporarily to prevent ` +
+              `another device from restoring it.`
+          );
+
           await this.loadTombstoneList(modal);
+          await this.loadSyncDiagnostics(modal);
         } catch (error) {
-          alert(`Failed to permanently delete item: ${error.message}`);
+          alert(
+            `Failed to permanently delete item: ${error.message}`
+          );
+
           this.logger.log(
             "error",
             `Permanent delete failed for ${itemId}`,
             error
           );
+
           deleteButton.disabled = false;
         }
       };
@@ -8015,8 +8197,13 @@ async download(key, isMetadata = false) {
 
       const newConfig = {
         storageType: storageType,
-        syncInterval:
-          parseInt(modal.querySelector("#sync-interval").value) || 15,
+        syncInterval: Math.max(
+          parseInt(
+            modal.querySelector("#sync-interval").value,
+            10
+          ) || 60,
+          60
+        ),
         encryptionKey: modal.querySelector("#encryption-key").value.trim(),
       };
 
@@ -8047,8 +8234,10 @@ async download(key, isMetadata = false) {
 
       const exclusions = modal.querySelector("#sync-exclusions").value;
 
-      if (newConfig.syncInterval < 15) {
-        alert("Sync interval must be at least 15 seconds");
+      if (newConfig.syncInterval < 60) {
+        alert(
+          "Sync interval must be at least 60 seconds"
+        );
         return;
       }
       if (!newConfig.encryptionKey) {
@@ -8189,7 +8378,10 @@ async download(key, isMetadata = false) {
         return;
       }
       
-      const interval = Math.max(this.config.get("syncInterval") * 1000, 15000);
+      const interval = Math.max(
+        Number(this.config.get("syncInterval") || 60) * 1000,
+        60000
+      );
 
       this.autoSyncInterval = setInterval(async () => {
         if (
@@ -8311,9 +8503,18 @@ async loadTombstoneList(modal) {
     }
 
     try {
-        const tombstones = Object.entries(this.syncOrchestrator.metadata.items)
-            .filter(([key, item]) => item.deleted)
-            .sort((a, b) => b[1].deleted - a[1].deleted);
+        const tombstones = Object.entries(
+          this.syncOrchestrator.metadata.items
+        )
+          .filter(
+            ([key, item]) =>
+              item.deleted &&
+              !item.payloadDeleted
+          )
+          .sort(
+            (a, b) =>
+              b[1].deleted - a[1].deleted
+          );
 
         if (tombstones.length === 0) {
             tableBody.innerHTML = '<tr><td colspan="4" class="p-4 text-center text-zinc-500">No recently deleted items found.</td></tr>';
