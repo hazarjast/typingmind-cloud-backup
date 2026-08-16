@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-16.1";
+const TCS_BUILD_VERSION = "2026-08-16.2";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -5624,6 +5624,15 @@ async download(key, isMetadata = false) {
       this.DAILY_LEASE_PROGRESS_STALE_MS =
         10 * 60 * 1000;
 
+      /*
+       * Do not issue a remote lease GET before every two-file backup chunk.
+       * Heartbeat renewals and progress updates also verify ownership.
+       */
+      this.DAILY_LEASE_VERIFY_INTERVAL_MS =
+        15 * 1000;
+
+      this.lastDailyLeaseVerificationAt = 0;
+
       this.activeDailyBackupLease = null;
       this.dailyLeaseHeartbeatTimer = null;
       this.dailyLeaseUpdateChain =
@@ -6008,7 +6017,9 @@ async download(key, isMetadata = false) {
       }
     }
 
-    async _assertDailyBackupLeaseOwned() {
+    async _assertDailyBackupLeaseOwned(
+      forceRemoteCheck = false
+    ) {
       const active =
         this.activeDailyBackupLease;
 
@@ -6016,6 +6027,23 @@ async download(key, isMetadata = false) {
         throw new Error(
           "No active daily-backup lease"
         );
+      }
+
+      const now = Date.now();
+
+      /*
+       * Heartbeat and progress renewals already perform a conditional write
+       * followed by read-back verification. Between those operations, avoid
+       * another lease GET for every two-file upload chunk.
+       */
+      if (
+        !forceRemoteCheck &&
+        this.lastDailyLeaseVerificationAt &&
+        now -
+          this.lastDailyLeaseVerificationAt <
+          this.DAILY_LEASE_VERIFY_INTERVAL_MS
+      ) {
+        return true;
       }
 
       const remote =
@@ -6046,6 +6074,9 @@ async download(key, isMetadata = false) {
         etag:
           remote.etag || null,
       };
+
+      this.lastDailyLeaseVerificationAt =
+        now;
 
       return true;
     }
@@ -6522,7 +6553,9 @@ async download(key, isMetadata = false) {
        * Confirm that this device still owns the cloud lease before deleting
        * or writing anything in its unique backup folder.
        */
-      await this._assertDailyBackupLeaseOwned();
+      await this._assertDailyBackupLeaseOwned(
+        true
+      );
 
       /*
        * A previous attempt using this lease-specific folder may have been
@@ -6537,7 +6570,9 @@ async download(key, isMetadata = false) {
         backupFolder
       );
 
-      await this._assertDailyBackupLeaseOwned();
+      await this._assertDailyBackupLeaseOwned(
+        true
+      );
 
       this.logger.log(
         "info",
@@ -6882,7 +6917,9 @@ async download(key, isMetadata = false) {
          * Verify ownership again before publishing the authoritative backup
          * metadata.
          */
-        await this._assertDailyBackupLeaseOwned();
+        await this._assertDailyBackupLeaseOwned(
+          true
+        );
 
         await this._renewDailyBackupLease(
           {
@@ -6924,7 +6961,9 @@ async download(key, isMetadata = false) {
          * The manifest and index make the backup visible as restorable.
          * Never publish them after losing the lease.
          */
-        await this._assertDailyBackupLeaseOwned();
+        await this._assertDailyBackupLeaseOwned(
+          true
+        );
 
         await this._renewDailyBackupLease(
           {
@@ -6946,7 +6985,9 @@ async download(key, isMetadata = false) {
           true
         );
 
-        await this._assertDailyBackupLeaseOwned();
+        await this._assertDailyBackupLeaseOwned(
+          true
+        );
 
         await this._addOrUpdateBackupInIndex(
           manifest
@@ -7795,6 +7836,7 @@ async download(key, isMetadata = false) {
 
       this._dailyBackupRunning = false;
       this.activeDailyBackupLease = null;
+      this.lastDailyLeaseVerificationAt = 0;
       this.dailyLeaseUpdateChain =
         Promise.resolve();
     }
