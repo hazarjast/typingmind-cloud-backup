@@ -123,6 +123,102 @@ if (window.typingMindCloudSync) {
     );
   }
 
+  function isConditionalWriteConflict(error) {
+    const statusCode =
+      error?.statusCode ||
+      error?.status ||
+      error?.$metadata?.httpStatusCode;
+
+    const code =
+      error?.code ||
+      error?.name ||
+      error?.result?.error?.code;
+
+    return (
+      statusCode === 409 ||
+      statusCode === 412 ||
+      code === "PreconditionFailed" ||
+      code === "ConditionalRequestConflict"
+    );
+  }
+
+  function isConditionalWriteUnsupported(error) {
+    const statusCode =
+      error?.statusCode ||
+      error?.status ||
+      error?.$metadata?.httpStatusCode;
+
+    const code =
+      error?.code ||
+      error?.name ||
+      error?.result?.error?.code;
+
+    const message =
+      getErrorMessage(error).toLowerCase();
+
+    return (
+      statusCode === 400 ||
+      statusCode === 501 ||
+      code === "NotImplemented" ||
+      code === "UnsupportedOperation" ||
+      code === "UnexpectedParameter" ||
+      message.includes("unexpected key") ||
+      message.includes("unexpectedparameter") ||
+      message.includes("ifmatch is not supported") ||
+      message.includes("ifnonematch is not supported")
+    );
+  }
+
+  function decodeJsonResponseBody(body) {
+    let text;
+
+    if (typeof body === "string") {
+      text = body;
+    } else if (body instanceof Uint8Array) {
+      text = new TextDecoder().decode(body);
+    } else if (body instanceof ArrayBuffer) {
+      text = new TextDecoder().decode(
+        new Uint8Array(body)
+      );
+    } else if (
+      body &&
+      ArrayBuffer.isView(body)
+    ) {
+      text = new TextDecoder().decode(
+        new Uint8Array(
+          body.buffer,
+          body.byteOffset,
+          body.byteLength
+        )
+      );
+    } else {
+      text = String(body || "");
+    }
+
+    if (!text.trim()) {
+      return null;
+    }
+
+    return JSON.parse(text);
+  }
+
+  function createStableUuid() {
+    if (
+      globalThis.crypto &&
+      typeof globalThis.crypto.randomUUID === "function"
+    ) {
+      return globalThis.crypto.randomUUID();
+    }
+
+    return (
+      Date.now().toString(36) +
+      "-" +
+      Math.random().toString(36).slice(2) +
+      "-" +
+      Math.random().toString(36).slice(2)
+    );
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // CLASS: ConfigManager
   // Loads, saves, and validates all extension settings from localStorage
@@ -1727,6 +1823,40 @@ if (window.typingMindCloudSync) {
       throw new Error("Method 'upload()' must be implemented.");
     }
 
+    /**
+     * Uploads a small JSON object using optional conditional-write semantics.
+     *
+     * Providers that support compare-and-swap should override this method.
+     * The default implementation reports conditional writes as unsupported.
+     */
+    async uploadJsonConditional(
+      key,
+      data,
+      options = {}
+    ) {
+      const {
+        ifMatch = null,
+        ifNoneMatch = false,
+      } = options;
+
+      if (ifMatch || ifNoneMatch) {
+        const error = new Error(
+          `${this.constructor.name} does not implement conditional writes`
+        );
+
+        error.code = "ConditionalWriteUnsupported";
+        error.statusCode = 501;
+
+        throw error;
+      }
+
+      return this.upload(
+        key,
+        data,
+        true
+      );
+    }
+
     async download(key, isMetadata = false) {
       throw new Error("Method 'download()' must be implemented.");
     }
@@ -2015,7 +2145,64 @@ if (window.typingMindCloudSync) {
         }
       );
     }
+    async uploadJsonConditional(
+      key,
+      data,
+      options = {}
+    ) {
+      const {
+        ifMatch = null,
+        ifNoneMatch = false,
+      } = options;
 
+      const params = {
+        Bucket: this.config.get("bucketName"),
+        Key: key,
+        Body: JSON.stringify(data),
+        ContentType: "application/json",
+        CacheControl:
+          "no-cache, no-store, max-age=0, must-revalidate",
+      };
+
+      if (ifMatch) {
+        params.IfMatch = ifMatch;
+      }
+
+      if (ifNoneMatch) {
+        params.IfNoneMatch = "*";
+      }
+
+      try {
+        const result = await this.client
+          .putObject(params)
+          .promise();
+
+        this.logger.log(
+          "success",
+          `Conditionally uploaded ${key}`,
+          {
+            ETag: result.ETag,
+            ifMatch,
+            ifNoneMatch,
+          }
+        );
+
+        return result;
+      } catch (error) {
+        if (
+          !isConditionalWriteConflict(error) &&
+          !isConditionalWriteUnsupported(error)
+        ) {
+          this.logger.log(
+            "error",
+            `Conditional upload failed for ${key}: ` +
+              this.extractErrorDetails(error)
+          );
+        }
+
+        throw error;
+      }
+    }
     async uploadRaw(key, data) {
       return retryAsync(
         async () => {
@@ -3128,7 +3315,9 @@ async download(key, isMetadata = false) {
       this.autoSyncInterval = null;
       this.fullSyncPromise = null;
       this.lastSuccessfulFullSyncAt = 0;
-      this.currentCloudMetadata = null;      
+      this.currentCloudMetadata = null;
+      this.currentCloudMetadataETag = null;
+      this.conditionalMetadataWarningShown = false;     
     }
     loadMetadata() {
       const stored = localStorage.getItem("tcs_local-metadata");
@@ -3530,13 +3719,28 @@ async download(key, isMetadata = false) {
 
         if (itemsSynced > 0) {
           cloudMetadata.lastSync = Date.now();
-          await this.storageService.upload(
-            "metadata.json",
-            cloudMetadata,
-            true
+          const metadataUpload =
+            await this.uploadMetadataWithConflictRetry(
+              cloudMetadata,
+              this.currentCloudMetadataETag
+            );
+
+          this.metadata =
+            metadataUpload.metadata;
+
+          this.currentCloudMetadata =
+            metadataUpload.metadata;
+
+          this.currentCloudMetadataETag =
+            metadataUpload.etag;
+
+          this.metadata.lastSync =
+            metadataUpload.metadata.lastSync;
+
+          this.setLastCloudSync(
+            this.metadata.lastSync
           );
-          this.metadata.lastSync = cloudMetadata.lastSync;
-          this.setLastCloudSync(cloudMetadata.lastSync);
+
           this.saveMetadata();
           await this.updateSyncDiagnosticsCache();
           this.logger.log(
@@ -3596,6 +3800,9 @@ async download(key, isMetadata = false) {
         // Reuse this exact snapshot throughout the current full-sync cycle.
         // Do not fetch metadata.json two or three more times immediately.
         this.currentCloudMetadata = cloudMetadata;
+        this.currentCloudMetadataETag =
+          cloudMetadataETag || null;
+
         this.logger.log("info", "Downloaded cloud metadata", {
           ETag: cloudMetadataETag,
           lastSync: cloudMetadata.lastSync
@@ -4041,6 +4248,7 @@ async download(key, isMetadata = false) {
       }
 
       this.currentCloudMetadata = null;
+      this.currentCloudMetadataETag = null;
 
       this.fullSyncPromise = this._performFullSyncInternal()
         .then((result) => {
@@ -4050,6 +4258,7 @@ async download(key, isMetadata = false) {
         .finally(() => {
           this.fullSyncPromise = null;
           this.currentCloudMetadata = null;
+          this.currentCloudMetadataETag = null;
         });
 
       return this.fullSyncPromise;
@@ -4449,6 +4658,360 @@ async download(key, isMetadata = false) {
         this.logger.log("info", `🧹 Cleaned up ${cleanupCount} old tombstones`);
       }
       return cleanupCount;
+    }
+    _metadataTimestamp(value) {
+      if (typeof value === "number") {
+        return Number.isFinite(value) ? value : 0;
+      }
+
+      if (!value) {
+        return 0;
+      }
+
+      const parsed = new Date(value).getTime();
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    _chooseNewerMetadataEntry(
+      cloudEntry,
+      proposedEntry
+    ) {
+      if (!cloudEntry) {
+        return proposedEntry
+          ? { ...proposedEntry }
+          : null;
+      }
+
+      if (!proposedEntry) {
+        return { ...cloudEntry };
+      }
+
+      const cloudTombstoneVersion =
+        cloudEntry.tombstoneVersion || 0;
+
+      const proposedTombstoneVersion =
+        proposedEntry.tombstoneVersion || 0;
+
+      if (
+        proposedTombstoneVersion !==
+        cloudTombstoneVersion
+      ) {
+        return proposedTombstoneVersion >
+          cloudTombstoneVersion
+          ? { ...proposedEntry }
+          : { ...cloudEntry };
+      }
+
+      const cloudDeleted =
+        this._metadataTimestamp(
+          cloudEntry.deleted ||
+          cloudEntry.deletedAt
+        );
+
+      const proposedDeleted =
+        this._metadataTimestamp(
+          proposedEntry.deleted ||
+          proposedEntry.deletedAt
+        );
+
+      const cloudModified =
+        this._metadataTimestamp(
+          cloudEntry.lastModified
+        );
+
+      const proposedModified =
+        this._metadataTimestamp(
+          proposedEntry.lastModified
+        );
+
+      /*
+       * A deletion wins unless the active item was modified after the
+       * deletion marker was created.
+       */
+      if (cloudDeleted || proposedDeleted) {
+        if (
+          proposedDeleted &&
+          proposedDeleted >= cloudModified &&
+          proposedDeleted >= proposedModified
+        ) {
+          return { ...proposedEntry };
+        }
+
+        if (
+          cloudDeleted &&
+          cloudDeleted >= proposedModified &&
+          cloudDeleted >= cloudModified
+        ) {
+          return { ...cloudEntry };
+        }
+
+        if (proposedModified > cloudDeleted) {
+          return { ...proposedEntry };
+        }
+
+        if (cloudModified > proposedDeleted) {
+          return { ...cloudEntry };
+        }
+
+        return proposedDeleted >= cloudDeleted
+          ? { ...proposedEntry }
+          : { ...cloudEntry };
+      }
+
+      if (proposedModified !== cloudModified) {
+        return proposedModified > cloudModified
+          ? { ...proposedEntry }
+          : { ...cloudEntry };
+      }
+
+      const cloudSynced =
+        this._metadataTimestamp(
+          cloudEntry.synced
+        );
+
+      const proposedSynced =
+        this._metadataTimestamp(
+          proposedEntry.synced
+        );
+
+      if (proposedSynced !== cloudSynced) {
+        return proposedSynced > cloudSynced
+          ? { ...proposedEntry }
+          : { ...cloudEntry };
+      }
+
+      /*
+       * Equal timestamps but different fingerprints are ambiguous. Prefer the
+       * proposed entry because it represents data this client just uploaded.
+       */
+      if (
+        proposedEntry.chatFingerprint &&
+        proposedEntry.chatFingerprint !==
+          cloudEntry.chatFingerprint
+      ) {
+        return { ...proposedEntry };
+      }
+
+      return {
+        ...cloudEntry,
+        ...proposedEntry,
+      };
+    }
+
+    mergeCloudMetadata(
+      cloudMetadata,
+      proposedMetadata
+    ) {
+      const merged = {
+        ...(cloudMetadata || {}),
+        ...(proposedMetadata || {}),
+        items: {},
+      };
+
+      const cloudItems =
+        cloudMetadata?.items || {};
+
+      const proposedItems =
+        proposedMetadata?.items || {};
+
+      const allKeys = new Set([
+        ...Object.keys(cloudItems),
+        ...Object.keys(proposedItems),
+      ]);
+
+      for (const key of allKeys) {
+        const selected =
+          this._chooseNewerMetadataEntry(
+            cloudItems[key],
+            proposedItems[key]
+          );
+
+        if (selected) {
+          merged.items[key] = selected;
+        }
+      }
+
+      merged.lastSync = Math.max(
+        this._metadataTimestamp(
+          cloudMetadata?.lastSync
+        ),
+        this._metadataTimestamp(
+          proposedMetadata?.lastSync
+        ),
+        Date.now()
+      );
+
+      return merged;
+    }
+
+    async uploadMetadataWithConflictRetry(
+      proposedMetadata,
+      expectedETag = null,
+      maxAttempts = 4
+    ) {
+      let metadataToUpload =
+        this.mergeCloudMetadata(
+          { lastSync: 0, items: {} },
+          proposedMetadata
+        );
+
+      let etag =
+        expectedETag ||
+        this.currentCloudMetadataETag ||
+        null;
+
+      for (
+        let attempt = 1;
+        attempt <= maxAttempts;
+        attempt++
+      ) {
+        try {
+          let result;
+
+          if (etag) {
+            result =
+              await this.storageService
+                .uploadJsonConditional(
+                  "metadata.json",
+                  metadataToUpload,
+                  {
+                    ifMatch: etag,
+                  }
+                );
+          } else {
+            result =
+              await this.storageService
+                .uploadJsonConditional(
+                  "metadata.json",
+                  metadataToUpload,
+                  {
+                    ifNoneMatch: true,
+                  }
+                );
+          }
+
+          const newETag =
+            result?.ETag || null;
+
+          if (newETag) {
+            localStorage.setItem(
+              "tcs_metadata_etag",
+              newETag
+            );
+          } else {
+            localStorage.removeItem(
+              "tcs_metadata_etag"
+            );
+          }
+
+          this.currentCloudMetadata =
+            metadataToUpload;
+
+          this.currentCloudMetadataETag =
+            newETag;
+
+          return {
+            metadata: metadataToUpload,
+            etag: newETag,
+            conditional: true,
+          };
+        } catch (error) {
+          if (
+            isConditionalWriteUnsupported(error)
+          ) {
+            if (
+              !this.conditionalMetadataWarningShown
+            ) {
+              this.conditionalMetadataWarningShown =
+                true;
+
+              this.logger.log(
+                "warning",
+                "Storage provider does not support conditional metadata " +
+                  "writes. Falling back to ordinary metadata upload."
+              );
+            }
+
+            /*
+             * Refetch immediately before fallback upload so unrelated remote
+             * changes are merged even when compare-and-swap is unavailable.
+             */
+            const latest =
+              await this.getCloudMetadataWithETag();
+
+            metadataToUpload =
+              this.mergeCloudMetadata(
+                latest.metadata,
+                metadataToUpload
+              );
+
+            const result =
+              await this.storageService.upload(
+                "metadata.json",
+                metadataToUpload,
+                true
+              );
+
+            const fallbackETag =
+              result?.ETag || null;
+
+            if (fallbackETag) {
+              localStorage.setItem(
+                "tcs_metadata_etag",
+                fallbackETag
+              );
+            } else {
+              localStorage.removeItem(
+                "tcs_metadata_etag"
+              );
+            }
+
+            this.currentCloudMetadata =
+              metadataToUpload;
+
+            this.currentCloudMetadataETag =
+              fallbackETag;
+
+            return {
+              metadata: metadataToUpload,
+              etag: fallbackETag,
+              conditional: false,
+            };
+          }
+
+          if (
+            !isConditionalWriteConflict(error)
+          ) {
+            throw error;
+          }
+
+          this.logger.log(
+            "warning",
+            `metadata.json changed on another device while uploading. ` +
+              `Refetching and merging (${attempt}/${maxAttempts}).`
+          );
+
+          const latest =
+            await this.getCloudMetadataWithETag();
+
+          metadataToUpload =
+            this.mergeCloudMetadata(
+              latest.metadata,
+              metadataToUpload
+            );
+
+          etag = latest.etag || null;
+
+          await yieldToBrowser(
+            100 + Math.floor(Math.random() * 200)
+          );
+        }
+      }
+
+      throw new Error(
+        `Could not update metadata.json after ${maxAttempts} ` +
+          `conditional-write attempts`
+      );
     }
     async getCloudMetadataWithETag() {
       if (!this.storageService) {
@@ -5018,7 +5581,9 @@ async download(key, isMetadata = false) {
       this.metadata = null;
       this.fullSyncPromise = null;
       this.currentCloudMetadata = null;
+      this.currentCloudMetadataETag = null;
       this.lastSuccessfulFullSyncAt = 0;
+      this.conditionalMetadataWarningShown = false;
     }
   }
 
@@ -5038,9 +5603,45 @@ async download(key, isMetadata = false) {
       this.dataService = dataService;
       this.storageService = storageService;
       this.logger = logger;
-      this.BACKUP_INDEX_KEY = "backups/manifest-index.json";
+      this.BACKUP_INDEX_KEY =
+        "backups/manifest-index.json";
+
       this._dailyBackupRunning = false;
-      this.DAILY_BACKUP_LOCK_KEY = "tcs_daily_backup_lock";
+
+      /*
+       * Retained for migration compatibility. The cloud lease is now the
+       * authoritative cross-device lock.
+       */
+      this.DAILY_BACKUP_LOCK_KEY =
+        "tcs_daily_backup_lock";
+
+      this.DAILY_LEASE_HEARTBEAT_MS =
+        30 * 1000;
+
+      this.DAILY_LEASE_EXPIRES_MS =
+        2 * 60 * 1000;
+
+      this.DAILY_LEASE_PROGRESS_STALE_MS =
+        10 * 60 * 1000;
+
+      this.activeDailyBackupLease = null;
+      this.dailyLeaseHeartbeatTimer = null;
+      this.dailyLeaseUpdateChain =
+        Promise.resolve();
+
+      let deviceId =
+        localStorage.getItem("tcs_device_id");
+
+      if (!deviceId) {
+        deviceId = createStableUuid();
+
+        localStorage.setItem(
+          "tcs_device_id",
+          deviceId
+        );
+      }
+
+      this.deviceId = deviceId;
     }
     _getUtcDateString() {
       return new Date().toISOString().slice(0, 10).replace(/-/g, "");
@@ -5048,18 +5649,575 @@ async download(key, isMetadata = false) {
 
     async _hasDailyBackupForTodayUtc() {
       const today = this._getUtcDateString();
-      const index = (await this._getBackupIndex()) || [];
-      return index.some(
-        (m) =>
-          m &&
-          m.type === "daily-backup" &&
-          m.backupFolder &&
-          typeof m.backupFolder === "string" &&
-          m.backupFolder.endsWith(today)
+
+      const index =
+        (await this._getBackupIndex()) || [];
+
+      return index.some((manifest) => {
+        if (
+          !manifest ||
+          manifest.type !== "daily-backup"
+        ) {
+          return false;
+        }
+
+        if (manifest.date === today) {
+          return true;
+        }
+
+        return (
+          typeof manifest.backupFolder ===
+            "string" &&
+          manifest.backupFolder.includes(
+            `typingmind-backup-${today}`
+          )
+        );
+      });
+    }
+
+    _dailyLeaseKey(dateString) {
+      return (
+        `backups/.daily-backup-lease-` +
+        `${dateString}.json`
       );
     }
 
+    _dailyBackupFolder(
+      dateString,
+      leaseId
+    ) {
+      const shortLeaseId =
+        leaseId
+          .replace(/[^a-zA-Z0-9]/g, "")
+          .slice(0, 12);
 
+      return (
+        `backups/typingmind-backup-` +
+        `${dateString}-${shortLeaseId}`
+      );
+    }
+
+    async _readDailyBackupLease(
+      dateString
+    ) {
+      const key =
+        this._dailyLeaseKey(dateString);
+
+      try {
+        const response =
+          await this.storageService
+            .downloadWithResponse(key);
+
+        const lease =
+          decodeJsonResponseBody(
+            response.Body
+          );
+
+        if (!lease) {
+          return null;
+        }
+
+        return {
+          key,
+          etag:
+            response.ETag || null,
+          lease,
+        };
+      } catch (error) {
+        if (
+          error?.code === "NoSuchKey" ||
+          error?.statusCode === 404 ||
+          error?.status === 404 ||
+          error?.result?.error?.code === 404
+        ) {
+          return null;
+        }
+
+        throw error;
+      }
+    }
+
+    _isDailyBackupLeaseStale(
+      lease,
+      now = Date.now()
+    ) {
+      if (!lease) {
+        return true;
+      }
+
+      if (
+        lease.status === "failed" ||
+        lease.status === "abandoned"
+      ) {
+        return true;
+      }
+
+      const heartbeatAt =
+        Number(lease.heartbeatAt || 0);
+
+      const expiresAt =
+        Number(lease.expiresAt || 0);
+
+      const progressUpdatedAt =
+        Number(
+          lease.progressUpdatedAt ||
+          lease.startedAt ||
+          0
+        );
+
+      const heartbeatStale =
+        !heartbeatAt ||
+        now - heartbeatAt >
+          this.DAILY_LEASE_EXPIRES_MS;
+
+      const explicitlyExpired =
+        !expiresAt ||
+        expiresAt <= now;
+
+      const progressStale =
+        !!progressUpdatedAt &&
+        now - progressUpdatedAt >
+          this.DAILY_LEASE_PROGRESS_STALE_MS;
+
+      return (
+        heartbeatStale ||
+        explicitlyExpired ||
+        progressStale
+      );
+    }
+
+    async _writeDailyBackupLease(
+      lease,
+      options = {}
+    ) {
+      const {
+        ifMatch = null,
+        ifNoneMatch = false,
+      } = options;
+
+      const key =
+        this._dailyLeaseKey(lease.date);
+
+      try {
+        const result =
+          await this.storageService
+            .uploadJsonConditional(
+              key,
+              lease,
+              {
+                ifMatch,
+                ifNoneMatch,
+              }
+            );
+
+        return {
+          conditional: true,
+          etag:
+            result?.ETag || null,
+        };
+      } catch (error) {
+        if (
+          !isConditionalWriteUnsupported(error)
+        ) {
+          throw error;
+        }
+
+        this.logger.log(
+          "warning",
+          "Conditional cloud lease writes are unavailable. " +
+            "Using write/read ownership verification."
+        );
+
+        const result =
+          await this.storageService.upload(
+            key,
+            lease,
+            true
+          );
+
+        return {
+          conditional: false,
+          etag:
+            result?.ETag || null,
+        };
+      }
+    }
+
+    async _acquireDailyBackupLease(
+      dateString
+    ) {
+      const now = Date.now();
+
+      const existing =
+        await this._readDailyBackupLease(
+          dateString
+        );
+
+      if (
+        existing &&
+        !this._isDailyBackupLeaseStale(
+          existing.lease,
+          now
+        )
+      ) {
+        this.logger.log(
+          "skip",
+          `Daily backup is already running on device ` +
+            `"${existing.lease.ownerId}"`,
+          {
+            processedItems:
+              existing.lease.processedItems || 0,
+            totalItems:
+              existing.lease.totalItems || null,
+            heartbeatAt:
+              existing.lease.heartbeatAt,
+            progressUpdatedAt:
+              existing.lease.progressUpdatedAt,
+          }
+        );
+
+        return null;
+      }
+
+      const leaseId =
+        createStableUuid();
+
+      const backupFolder =
+        this._dailyBackupFolder(
+          dateString,
+          leaseId
+        );
+
+      const candidate = {
+        version: 1,
+        date: dateString,
+        leaseId,
+        ownerId: this.deviceId,
+        status: "running",
+        backupFolder,
+        startedAt: now,
+        heartbeatAt: now,
+        expiresAt:
+          now +
+          this.DAILY_LEASE_EXPIRES_MS,
+        processedItems: 0,
+        totalItems: null,
+        progressUpdatedAt: now,
+        buildVersion:
+          TCS_BUILD_VERSION,
+        supersedesBackupFolder:
+          existing?.lease?.backupFolder ||
+          null,
+      };
+
+      try {
+        const writeResult =
+          await this._writeDailyBackupLease(
+            candidate,
+            existing
+              ? {
+                  ifMatch:
+                    existing.etag,
+                }
+              : {
+                  ifNoneMatch: true,
+                }
+          );
+
+        /*
+         * Allow competing fallback writers time to settle before deciding
+         * who owns the lease.
+         */
+        if (!writeResult.conditional) {
+          await new Promise(
+            (resolve) =>
+              setTimeout(
+                resolve,
+                1000 +
+                  Math.floor(
+                    Math.random() * 750
+                  )
+              )
+          );
+        }
+
+        const verified =
+          await this._readDailyBackupLease(
+            dateString
+          );
+
+        if (
+          !verified ||
+          verified.lease.leaseId !==
+            leaseId ||
+          verified.lease.ownerId !==
+            this.deviceId
+        ) {
+          this.logger.log(
+            "skip",
+            "Another device won the daily-backup lease"
+          );
+
+          return null;
+        }
+
+        this.activeDailyBackupLease = {
+          ...verified.lease,
+          etag:
+            verified.etag ||
+            writeResult.etag ||
+            null,
+        };
+
+        /*
+         * A stale prior owner may have left an incomplete unique backup
+         * folder. Only the confirmed new owner may remove it.
+         */
+        if (
+          candidate.supersedesBackupFolder &&
+          candidate.supersedesBackupFolder !==
+            backupFolder
+        ) {
+          this.logger.log(
+            "info",
+            `Removing abandoned backup folder: ` +
+              candidate.supersedesBackupFolder
+          );
+
+          await this.storageService.deleteFolder(
+            candidate.supersedesBackupFolder
+          );
+        }
+
+        return {
+          ...this.activeDailyBackupLease,
+        };
+      } catch (error) {
+        if (
+          isConditionalWriteConflict(error)
+        ) {
+          this.logger.log(
+            "skip",
+            "Another device acquired the daily-backup lease first"
+          );
+
+          return null;
+        }
+
+        throw error;
+      }
+    }
+
+    async _assertDailyBackupLeaseOwned() {
+      const active =
+        this.activeDailyBackupLease;
+
+      if (!active) {
+        throw new Error(
+          "No active daily-backup lease"
+        );
+      }
+
+      const remote =
+        await this._readDailyBackupLease(
+          active.date
+        );
+
+      if (
+        !remote ||
+        remote.lease.leaseId !==
+          active.leaseId ||
+        remote.lease.ownerId !==
+          this.deviceId ||
+        remote.lease.status !== "running"
+      ) {
+        const error = new Error(
+          "Daily-backup lease ownership was lost"
+        );
+
+        error.code =
+          "DailyBackupLeaseLost";
+
+        throw error;
+      }
+
+      this.activeDailyBackupLease = {
+        ...remote.lease,
+        etag:
+          remote.etag || null,
+      };
+
+      return true;
+    }
+
+    async _renewDailyBackupLease(
+      updates = {},
+      progressChanged = false
+    ) {
+      this.dailyLeaseUpdateChain =
+        this.dailyLeaseUpdateChain
+          .catch(() => {})
+          .then(async () => {
+            const active =
+              this.activeDailyBackupLease;
+
+            if (!active) {
+              throw new Error(
+                "Cannot renew a missing daily-backup lease"
+              );
+            }
+
+            const now = Date.now();
+
+            const nextLease = {
+              ...active,
+              heartbeatAt: now,
+              expiresAt:
+                now +
+                this.DAILY_LEASE_EXPIRES_MS,
+              ...updates,
+            };
+
+            delete nextLease.etag;
+
+            if (progressChanged) {
+              nextLease.progressUpdatedAt =
+                now;
+            }
+
+            let writeResult;
+
+            try {
+              writeResult =
+                await this._writeDailyBackupLease(
+                  nextLease,
+                  active.etag
+                    ? {
+                        ifMatch:
+                          active.etag,
+                      }
+                    : {}
+                );
+            } catch (error) {
+              if (
+                isConditionalWriteConflict(error)
+              ) {
+                this.activeDailyBackupLease =
+                  null;
+
+                throw new Error(
+                  "Daily-backup lease was replaced by another device"
+                );
+              }
+
+              throw error;
+            }
+
+            const verified =
+              await this._readDailyBackupLease(
+                nextLease.date
+              );
+
+            if (
+              !verified ||
+              verified.lease.leaseId !==
+                nextLease.leaseId ||
+              verified.lease.ownerId !==
+                this.deviceId
+            ) {
+              this.activeDailyBackupLease =
+                null;
+
+              throw new Error(
+                "Daily-backup lease verification failed"
+              );
+            }
+
+            this.activeDailyBackupLease = {
+              ...verified.lease,
+              etag:
+                verified.etag ||
+                writeResult.etag ||
+                null,
+            };
+
+            return {
+              ...this.activeDailyBackupLease,
+            };
+          });
+
+      return this.dailyLeaseUpdateChain;
+    }
+
+    _startDailyBackupLeaseHeartbeat() {
+      this._stopDailyBackupLeaseHeartbeat();
+
+      this.dailyLeaseHeartbeatTimer =
+        setInterval(() => {
+          void this
+            ._renewDailyBackupLease()
+            .catch((error) => {
+              this.logger.log(
+                "error",
+                "Daily-backup lease heartbeat failed",
+                getErrorMessage(error)
+              );
+
+              this._stopDailyBackupLeaseHeartbeat();
+            });
+        }, this.DAILY_LEASE_HEARTBEAT_MS);
+    }
+
+    _stopDailyBackupLeaseHeartbeat() {
+      if (
+        this.dailyLeaseHeartbeatTimer
+      ) {
+        clearInterval(
+          this.dailyLeaseHeartbeatTimer
+        );
+
+        this.dailyLeaseHeartbeatTimer =
+          null;
+      }
+    }
+
+    async _finishDailyBackupLease(
+      status,
+      extra = {}
+    ) {
+      if (
+        !this.activeDailyBackupLease
+      ) {
+        return;
+      }
+
+      try {
+        await this._renewDailyBackupLease(
+          {
+            status,
+            completedAt:
+              status === "completed"
+                ? Date.now()
+                : null,
+            failedAt:
+              status === "failed"
+                ? Date.now()
+                : null,
+            expiresAt:
+              Date.now() + 60 * 1000,
+            ...extra,
+          },
+          true
+        );
+      } catch (error) {
+        this.logger.log(
+          "warning",
+          "Could not finalize daily-backup lease",
+          getErrorMessage(error)
+        );
+      }
+    }
+    
     async createSnapshot(name) {
       this.logger.log("start", `Creating server-side snapshot: ${name}`);
       try {
@@ -5076,60 +6234,158 @@ async download(key, isMetadata = false) {
     }
 
     async checkAndPerformDailyBackup() {
-      if (!this.storageService || !this.storageService.isConfigured()) {
+      if (
+        !this.storageService ||
+        !this.storageService.isConfigured()
+      ) {
         this.logger.log(
           "skip",
           "Storage provider not configured, skipping daily backup."
         );
+
         return false;
       }
-      const nowMs = Date.now();
-      const todayUtc = this._getUtcDateString();
-      const lastAttemptDay = localStorage.getItem("tcs_daily_backup_attempt_day") || "";
-      const lastAttemptMs = Number(localStorage.getItem("tcs_daily_backup_attempt_ms") || "0");
-      const attemptCooldownMs = 30 * 60 * 1000;
-      if (lastAttemptDay === todayUtc && lastAttemptMs && nowMs - lastAttemptMs < attemptCooldownMs) {
-        this.logger.log("skip", "Daily backup check throttled (cooldown active).");
-        return false;
-      }
-      localStorage.setItem("tcs_daily_backup_attempt_day", todayUtc);
-      localStorage.setItem("tcs_daily_backup_attempt_ms", String(nowMs));
+
       if (this._dailyBackupRunning) {
-        this.logger.log("skip", "Daily backup already running, skipping.");
+        this.logger.log(
+          "skip",
+          "Daily backup already running on this device."
+        );
+
         return false;
       }
-      const lockNowMs = Date.now();
-      const lockTtlMs = 30 * 60 * 1000;
-      const lastLock = Number(localStorage.getItem(this.DAILY_BACKUP_LOCK_KEY) || "0");
-      if (lastLock && lockNowMs - lastLock < lockTtlMs) {
-        this.logger.log("skip", "Daily backup lock active, skipping.");
+
+      const nowMs = Date.now();
+      const todayUtc =
+        this._getUtcDateString();
+
+      if (
+        localStorage.getItem(
+          "tcs_last-daily-backup"
+        ) === todayUtc
+      ) {
         return false;
       }
-      localStorage.setItem(this.DAILY_BACKUP_LOCK_KEY, String(lockNowMs));
+
+      const lastAttemptDay =
+        localStorage.getItem(
+          "tcs_daily_backup_attempt_day"
+        ) || "";
+
+      const lastAttemptMs =
+        Number(
+          localStorage.getItem(
+            "tcs_daily_backup_attempt_ms"
+          ) || "0"
+        );
+
+      const attemptCooldownMs =
+        60 * 1000;
+
+      if (
+        lastAttemptDay === todayUtc &&
+        lastAttemptMs &&
+        nowMs - lastAttemptMs <
+          attemptCooldownMs
+      ) {
+        this.logger.log(
+          "skip",
+          "Daily backup lease check throttled locally"
+        );
+
+        return false;
+      }
+
+      localStorage.setItem(
+        "tcs_daily_backup_attempt_day",
+        todayUtc
+      );
+
+      localStorage.setItem(
+        "tcs_daily_backup_attempt_ms",
+        String(nowMs)
+      );
+
+      if (
+        await this._hasDailyBackupForTodayUtc()
+      ) {
+        localStorage.setItem(
+          "tcs_last-daily-backup",
+          todayUtc
+        );
+
+        return false;
+      }
+
+      const lease =
+        await this._acquireDailyBackupLease(
+          todayUtc
+        );
+
+      if (!lease) {
+        return false;
+      }
+
       this._dailyBackupRunning = true;
+      this._startDailyBackupLeaseHeartbeat();
 
       try {
-        const alreadyDoneInCloud = await this._hasDailyBackupForTodayUtc();
-        if (alreadyDoneInCloud) {
-          this.logger.log("info", "Daily backup already exists in cloud for today (UTC).");
-          return false;
-        }
-        this.logger.log("info", "Starting daily backup...");
-        await this.performDailyBackup();
-        localStorage.setItem("tcs_last-daily-backup", this._getUtcDateString());
-        this.logger.log("success", "Daily backup completed");
+        this.logger.log(
+          "info",
+          `Starting daily backup as lease owner ${lease.leaseId}`
+        );
+
+        await this.performDailyBackup(
+          lease
+        );
+
+        localStorage.setItem(
+          "tcs_last-daily-backup",
+          todayUtc
+        );
+
+        await this._finishDailyBackupLease(
+          "completed"
+        );
+
+        this.logger.log(
+          "success",
+          "Daily backup completed"
+        );
+
         return true;
+      } catch (error) {
+        await this._finishDailyBackupLease(
+          "failed",
+          {
+            error:
+              getErrorMessage(error),
+          }
+        );
+
+        this.logger.log(
+          "error",
+          "Daily backup failed",
+          getErrorMessage(error)
+        );
+
+        throw error;
       } finally {
-        localStorage.removeItem(this.DAILY_BACKUP_LOCK_KEY);
+        this._stopDailyBackupLeaseHeartbeat();
+
         this._dailyBackupRunning = false;
+        this.activeDailyBackupLease =
+          null;
       }
     }
 
-    async performDailyBackup() {
+    async performDailyBackup(lease) {
       this.logger.log("info", "Starting daily backup (export-style upload)");
       try {
         await this.ensureSyncIsCurrent();
-        return await this.createDailyBackupFromLocalExport();
+        return await this.createDailyBackupFromLocalExport(
+          lease
+        );
       } catch (error) {
         this.logger.log(
           "error",
@@ -5209,123 +6465,438 @@ async download(key, isMetadata = false) {
      * - Export-style backups serialize from local data and upload via PUT,
      *   yielding deterministic, content-correct backup objects.
      */
-    async createDailyBackupFromLocalExport() {
-      const dateString = this._getUtcDateString();
-      const backupFolder = `backups/typingmind-backup-${dateString}`;
-      if (this.storageService instanceof GoogleDriveService) {
-        await this.storageService._deleteFolderIfExists(backupFolder);
+    async waitForForegroundSync() {
+      const orchestrator =
+        window.cloudSyncApp?.syncOrchestrator;
+
+      /*
+       * An upload already sent to the provider cannot be preempted safely.
+       * Instead, pause before starting the next backup batch.
+       */
+      while (
+        orchestrator &&
+        (
+          orchestrator.syncInProgress ||
+          orchestrator.fullSyncPromise
+        )
+      ) {
+        this.logger.log(
+          "info",
+          "Daily backup paused while foreground sync is running"
+        );
+
+        await new Promise(
+          (resolve) => setTimeout(resolve, 250)
+        );
       }
+
+      /*
+       * When TypingMind is visible, give pending typing, scrolling, and
+       * rendering work an opportunity to run before another backup batch.
+       */
+      if (document.visibilityState === "visible") {
+        await yieldIfInputPending();
+      }
+    }
+    async createDailyBackupFromLocalExport(
+      lease
+    ) {
+      if (
+        !lease ||
+        !lease.leaseId ||
+        !lease.backupFolder
+      ) {
+        throw new Error(
+          "Daily backup requires an active cloud lease"
+        );
+      }
+
+      const dateString =
+        lease.date ||
+        this._getUtcDateString();
+
+      const backupFolder =
+        lease.backupFolder;
+
+      /*
+       * Confirm that this device still owns the cloud lease before deleting
+       * or writing anything in its unique backup folder.
+       */
+      await this._assertDailyBackupLeaseOwned();
+
+      /*
+       * A previous attempt using this lease-specific folder may have been
+       * interrupted. Start from an empty folder.
+       */
+      this.logger.log(
+        "info",
+        `Removing any incomplete daily-backup folder: ${backupFolder}`
+      );
+
+      await this.storageService.deleteFolder(
+        backupFolder
+      );
+
+      await this._assertDailyBackupLeaseOwned();
 
       this.logger.log(
         "info",
-        `Creating daily backup via upload: ${backupFolder} (local export snapshot)`
+        `Creating daily backup via upload: ${backupFolder} ` +
+          `(local export snapshot)`
       );
 
-      const itemsDestinationPath = `${backupFolder}/items`;
-      await this.storageService.ensurePathExists(itemsDestinationPath);
+      const itemsDestinationPath =
+        `${backupFolder}/items`;
 
-      const orchestrator = window.cloudSyncApp?.syncOrchestrator;
+      await this.storageService.ensurePathExists(
+        itemsDestinationPath
+      );
+
+      const orchestrator =
+        window.cloudSyncApp?.syncOrchestrator;
+
       const now = Date.now();
+
+      /*
+       * This key-only scan is substantially cheaper than serializing all
+       * values and gives the lease and progress display a stable estimate.
+       */
+      const expectedItemCount =
+        (
+          await this.dataService.getAllItemKeys()
+        ).size;
+
       let uploadedItems = 0;
-      let totalItems = 0;
+      let encounteredItems = 0;
+      let lastUploadProgressLogged = 0;
+
+      await this._renewDailyBackupLease(
+        {
+          phase: "preparing",
+          processedItems: 0,
+          totalItems: expectedItemCount,
+        },
+        true
+      );
 
       try {
-        for await (const batch of this.dataService.streamAllItemsInternal()) {
-          totalItems += batch.length;
+        /*
+         * Pass one: encrypt and upload every local item.
+         */
+        for await (
+          const batch of
+          this.dataService.streamAllItemsInternal()
+        ) {
+          encounteredItems += batch.length;
 
           const CHUNK = 2;
           const allResults = [];
-          for (let ci = 0; ci < batch.length; ci += CHUNK) {
-            const chunk = batch.slice(ci, ci + CHUNK);
-            const uploadPromises = chunk.map(async (item) => {
-              if (item.id.startsWith("tcs_tombstone_")) {
-                return "skipped";
-              }
-              if (item.type === "blob" && item.data instanceof Blob) {
-                const arrayBuf = await item.data.arrayBuffer();
-                const uint8 = new Uint8Array(arrayBuf);
-                await this.storageService.upload(
-                  `${backupFolder}/attachments/${item.id}.bin`,
-                  uint8
-                );
-              } else {
-                const key = `${backupFolder}/items/${item.id}.json`;
-                await this.storageService.upload(key, item.data);
-              }
-            });
-            const chunkResults =
-              await Promise.allSettled(uploadPromises);
 
-            const failedUploads = chunkResults.filter(
-              (result) => result.status === "rejected"
+          for (
+            let chunkIndex = 0;
+            chunkIndex < batch.length;
+            chunkIndex += CHUNK
+          ) {
+            /*
+             * Ordinary foreground sync has priority over backup work.
+             */
+            await this.waitForForegroundSync();
+
+            /*
+             * Another device may have taken over a stale lease. Verify
+             * ownership before starting every upload batch.
+             */
+            await this._assertDailyBackupLeaseOwned();
+
+            const chunk = batch.slice(
+              chunkIndex,
+              chunkIndex + CHUNK
             );
+
+            const uploadPromises =
+              chunk.map(async (item) => {
+                if (
+                  item.id.startsWith(
+                    "tcs_tombstone_"
+                  )
+                ) {
+                  return "skipped";
+                }
+
+                if (
+                  item.type === "blob" &&
+                  item.data instanceof Blob
+                ) {
+                  const arrayBuffer =
+                    await item.data.arrayBuffer();
+
+                  const bytes =
+                    new Uint8Array(arrayBuffer);
+
+                  await this.storageService.upload(
+                    `${backupFolder}/attachments/${item.id}.bin`,
+                    bytes
+                  );
+                } else {
+                  const key =
+                    `${backupFolder}/items/${item.id}.json`;
+
+                  await this.storageService.upload(
+                    key,
+                    item.data,
+                    false,
+                    item.id
+                  );
+                }
+
+                return "uploaded";
+              });
+
+            const chunkResults =
+              await Promise.allSettled(
+                uploadPromises
+              );
+
+            const failedUploads =
+              chunkResults.filter(
+                (result) =>
+                  result.status === "rejected"
+              );
 
             if (failedUploads.length > 0) {
               throw new Error(
-                `Daily backup stopped because ${failedUploads.length} ` +
-                  `item(s) failed in the current batch. First error: ` +
-                  getErrorMessage(failedUploads[0].reason)
+                `Daily backup stopped because ` +
+                  `${failedUploads.length} item(s) failed ` +
+                  `in the current batch. First error: ` +
+                  getErrorMessage(
+                    failedUploads[0].reason
+                  )
               );
             }
 
             allResults.push(...chunkResults);
-            if (ci + CHUNK < batch.length) {
+
+            if (
+              chunkIndex + CHUNK <
+              batch.length
+            ) {
               await yieldIfInputPending();
             }
           }
-          uploadedItems += allResults.filter(
-            (result) =>
-              result.status === "fulfilled" &&
-              result.value !== "skipped"
-          ).length;
 
-          if (uploadedItems % 200 === 0) {
+          uploadedItems +=
+            allResults.filter(
+              (result) =>
+                result.status === "fulfilled" &&
+                result.value === "uploaded"
+            ).length;
+
+          /*
+           * Progress updates also prove to other devices that the lease owner
+           * is still actively advancing the backup.
+           */
+          await this._renewDailyBackupLease(
+            {
+              phase: "uploading",
+              processedItems: uploadedItems,
+              totalItems: Math.max(
+                expectedItemCount,
+                encounteredItems
+              ),
+            },
+            true
+          );
+
+          if (
+            uploadedItems -
+              lastUploadProgressLogged >=
+              200 ||
+            uploadedItems >=
+              expectedItemCount
+          ) {
+            lastUploadProgressLogged =
+              uploadedItems;
+
             this.logger.log(
               "info",
-              `Daily backup upload progress: ${uploadedItems}/${totalItems}`
+              `Daily backup upload progress: ` +
+                `${uploadedItems}/` +
+                `${Math.max(
+                  expectedItemCount,
+                  encounteredItems
+                )}`
             );
           }
         }
-        const backupMetadata = { lastSync: now, items: {} };
-        for await (const batch of this.dataService.streamAllItemsInternal()) {
+
+        /*
+         * Pass two: build metadata corresponding to the backed-up items.
+         */
+        const backupMetadata = {
+          lastSync: now,
+          items: {},
+        };
+
+        let metadataProcessedItems = 0;
+
+        for await (
+          const batch of
+          this.dataService.streamAllItemsInternal()
+        ) {
+          await this.waitForForegroundSync();
+          await this._assertDailyBackupLeaseOwned();
+
           for (const item of batch) {
-            if (item.id.startsWith("tcs_tombstone_")) continue;
+            if (
+              item.id.startsWith(
+                "tcs_tombstone_"
+              )
+            ) {
+              continue;
+            }
+
             const metadataEntry = {
               synced: now,
               type: item.type,
             };
+
             if (item.type === "blob") {
-              let detectedMime = item.blobType || (item.data instanceof Blob ? item.data.type : "");
-              if (!detectedMime || detectedMime === "application/octet-stream") {
-                detectedMime = item.data instanceof Blob
-                  ? await item.data.arrayBuffer().then(ab => detectMimeFromBytes(new Uint8Array(ab))).catch(() => "application/octet-stream")
-                  : detectMimeFromBytes(item.data);
+              let detectedMime =
+                item.blobType ||
+                (
+                  item.data instanceof Blob
+                    ? item.data.type
+                    : ""
+                );
+
+              if (
+                !detectedMime ||
+                detectedMime ===
+                  "application/octet-stream"
+              ) {
+                if (
+                  item.data instanceof Blob
+                ) {
+                  try {
+                    const arrayBuffer =
+                      await item.data.arrayBuffer();
+
+                    detectedMime =
+                      detectMimeFromBytes(
+                        new Uint8Array(
+                          arrayBuffer
+                        )
+                      );
+                  } catch {
+                    detectedMime =
+                      "application/octet-stream";
+                  }
+                } else {
+                  detectedMime =
+                    detectMimeFromBytes(
+                      item.data
+                    );
+                }
               }
-              metadataEntry.blobType = detectedMime;
-              metadataEntry.size = item.size || (item.data instanceof Blob ? item.data.size : 0);
-              metadataEntry.lastModified = now;
+
+              metadataEntry.blobType =
+                detectedMime;
+
+              metadataEntry.size =
+                item.size ??
+                (
+                  item.data instanceof Blob
+                    ? item.data.size
+                    : 0
+                );
+
+              metadataEntry.lastModified =
+                now;
             } else if (
               orchestrator &&
               item.id.startsWith("CHAT_") &&
-              item.type === "idb" &&
-              item.data?.updatedAt
+              item.type === "idb"
             ) {
-              metadataEntry.lastModified = item.data.updatedAt;
-              if (typeof orchestrator.getChatFingerprint === "function") {
-                metadataEntry.chatFingerprint = orchestrator.getChatFingerprint(
-                  item.data
-                );
+              metadataEntry.lastModified =
+                item.data?.updatedAt ||
+                item.data?.updated_at ||
+                item.data?.lastUpdated ||
+                item.data?.modifiedAt ||
+                now;
+
+              if (
+                typeof orchestrator
+                  .getChatFingerprint ===
+                "function"
+              ) {
+                metadataEntry.chatFingerprint =
+                  orchestrator
+                    .getChatFingerprint(
+                      item.data
+                    );
               }
             } else {
-              if (orchestrator && typeof orchestrator.getItemSize === "function") {
-                metadataEntry.size = orchestrator.getItemSize(item.data);
+              if (
+                orchestrator &&
+                typeof orchestrator
+                  .getItemSize ===
+                "function"
+              ) {
+                metadataEntry.size =
+                  orchestrator.getItemSize(
+                    item.data
+                  );
               }
-              metadataEntry.lastModified = now;
+
+              metadataEntry.lastModified =
+                now;
             }
 
-            backupMetadata.items[item.id] = metadataEntry;
+            backupMetadata.items[item.id] =
+              metadataEntry;
           }
+
+          metadataProcessedItems +=
+            batch.length;
+
+          /*
+           * Updating progress during metadata generation prevents another
+           * device from treating a long second pass as stalled.
+           */
+          await this._renewDailyBackupLease(
+            {
+              phase: "building-metadata",
+              processedItems:
+                uploadedItems,
+              metadataProcessedItems,
+              totalItems: Math.max(
+                expectedItemCount,
+                encounteredItems
+              ),
+            },
+            true
+          );
         }
+
+        /*
+         * Verify ownership again before publishing the authoritative backup
+         * metadata.
+         */
+        await this._assertDailyBackupLeaseOwned();
+
+        await this._renewDailyBackupLease(
+          {
+            phase: "publishing-metadata",
+            processedItems:
+              uploadedItems,
+            metadataProcessedItems,
+            totalItems: Math.max(
+              expectedItemCount,
+              encounteredItems
+            ),
+          },
+          true
+        );
 
         await this.storageService.upload(
           `${backupFolder}/metadata.json`,
@@ -5336,34 +6907,74 @@ async download(key, isMetadata = false) {
         const manifest = {
           type: "daily-backup",
           name: "daily-auto",
+          date: dateString,
           created: now,
-          totalItems: totalItems,
+          totalItems: encounteredItems,
           copiedItems: uploadedItems,
           format: "export-upload",
-          version: "3.1",
-          backupFolder: backupFolder,
+          version: "3.2",
+          backupFolder,
+          leaseId: lease.leaseId,
+          ownerId: lease.ownerId,
+          buildVersion:
+            TCS_BUILD_VERSION,
         };
+
+        /*
+         * The manifest and index make the backup visible as restorable.
+         * Never publish them after losing the lease.
+         */
+        await this._assertDailyBackupLeaseOwned();
+
+        await this._renewDailyBackupLease(
+          {
+            phase: "publishing-manifest",
+            processedItems:
+              uploadedItems,
+            metadataProcessedItems,
+            totalItems: Math.max(
+              expectedItemCount,
+              encounteredItems
+            ),
+          },
+          true
+        );
 
         await this.storageService.upload(
           `${backupFolder}/backup-manifest.json`,
           manifest,
           true
         );
-        await this._addOrUpdateBackupInIndex(manifest);
+
+        await this._assertDailyBackupLeaseOwned();
+
+        await this._addOrUpdateBackupInIndex(
+          manifest
+        );
 
         this.logger.log(
           "success",
-          `Daily backup created via upload: ${backupFolder} (${uploadedItems}/${totalItems} items uploaded)`
+          `Daily backup created via upload: ` +
+            `${backupFolder} ` +
+            `(${uploadedItems}/` +
+            `${encounteredItems} items uploaded)`
         );
 
         await this.cleanupOldBackups();
+
         return true;
       } catch (error) {
         const errorMessage =
-          error.result?.error?.message ||
-          error.message ||
+          error?.result?.error?.message ||
+          error?.message ||
           JSON.stringify(error);
-        this.logger.log("error", `Daily backup via upload failed: ${errorMessage}`);
+
+        this.logger.log(
+          "error",
+          `Daily backup via upload failed: ` +
+            errorMessage
+        );
+
         throw error;
       }
     }
@@ -6179,6 +7790,14 @@ async download(key, isMetadata = false) {
         );
       }
     }
+    cleanup() {
+      this._stopDailyBackupLeaseHeartbeat();
+
+      this._dailyBackupRunning = false;
+      this.activeDailyBackupLease = null;
+      this.dailyLeaseUpdateChain =
+        Promise.resolve();
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -6577,6 +8196,14 @@ async download(key, isMetadata = false) {
       this.backupService = null;
 
       this.autoSyncInterval = null;
+
+      /*
+       * Prevent setInterval from starting another automatic cycle while
+       * the previous cycle, including its daily-backup check, is still
+       * running.
+       */
+      this.autoSyncCycleRunning = false;
+
       this.eventListeners = [];
       this.modalCleanupCallbacks = [];
       this.noSyncMode = false;
@@ -8375,41 +10002,120 @@ async download(key, isMetadata = false) {
     }
 
     startAutoSync() {
-      if (this.autoSyncInterval) clearInterval(this.autoSyncInterval);
+      if (this.autoSyncInterval) {
+        clearInterval(this.autoSyncInterval);
+        this.autoSyncInterval = null;
+      }
+
       if (!this.autoSyncEnabled) {
-        this.logger.log('info', 'Auto-sync is disabled, skipping interval creation');
+        this.logger.log(
+          "info",
+          "Auto-sync is disabled, skipping interval creation"
+        );
         return;
       }
-      
+
       const interval = Math.max(
-        Number(this.config.get("syncInterval") || 60) * 1000,
+        Number(
+          this.config.get("syncInterval") || 60
+        ) * 1000,
         60000
       );
 
-      this.autoSyncInterval = setInterval(async () => {
-        if (
-          this.storageService &&
-          this.storageService.isConfigured() &&
-          !this.syncOrchestrator.syncInProgress
-        ) {
-          this.updateSyncStatus("syncing");
-          try {
-            await this.syncOrchestrator.performFullSync();
-            await this.backupService.checkAndPerformDailyBackup();
-
-            this.updateSyncStatus("success");
-          } catch (error) {
-            this.logger.log(
-              "error",
-              "Auto-sync/backup cycle failed",
-              error.message
-            );
-            this.updateSyncStatus("error");
-          }
+      const runAutoSyncCycle = async () => {
+        /*
+         * Prevent overlapping ordinary sync operations, but do not block
+         * ordinary sync merely because a daily backup is running.
+         */
+        if (this.autoSyncCycleRunning) {
+          this.logger.log(
+            "skip",
+            "Previous automatic sync is still running"
+          );
+          return;
         }
+
+        if (
+          !this.storageService ||
+          !this.storageService.isConfigured() ||
+          !this.syncOrchestrator
+        ) {
+          return;
+        }
+
+        this.autoSyncCycleRunning = true;
+        this.updateSyncStatus("syncing");
+
+        let syncSucceeded = false;
+
+        try {
+          await this.syncOrchestrator.performFullSync();
+
+          syncSucceeded = true;
+
+          this.updateSyncStatus("success");
+
+          this.logger.log(
+            "success",
+            "Automatic sync completed"
+          );
+        } catch (syncError) {
+          this.logger.log(
+            "error",
+            "Automatic sync failed",
+            getErrorMessage(syncError)
+          );
+
+          this.updateSyncStatus("error");
+        } finally {
+          /*
+           * Release the ordinary-sync lock before starting or checking the
+           * daily backup. Future auto-sync cycles remain available while
+           * the backup runs.
+           */
+          this.autoSyncCycleRunning = false;
+        }
+
+        if (!syncSucceeded) {
+          return;
+        }
+
+        /*
+         * Start the backup independently. Do not await it from the automatic
+         * sync cycle.
+         *
+         * BackupService has its own in-process guard. A cloud lease will add
+         * cross-device coordination.
+         */
+        if (!this.backupService._dailyBackupRunning) {
+          void this.backupService
+            .checkAndPerformDailyBackup()
+            .then((backupCreated) => {
+              if (backupCreated) {
+                this.logger.log(
+                  "success",
+                  "Automatic daily backup completed"
+                );
+              }
+            })
+            .catch((backupError) => {
+              this.logger.log(
+                "error",
+                "Automatic daily backup failed",
+                getErrorMessage(backupError)
+              );
+            });
+        }
+      };
+
+      this.autoSyncInterval = setInterval(() => {
+        void runAutoSyncCycle();
       }, interval);
 
-      this.logger.log("info", "Auto-sync and daily backup check started");
+      this.logger.log(
+        "info",
+        "Auto-sync and daily backup check started"
+      );
     }
 
     async getCloudMetadata() {
@@ -8427,6 +10133,8 @@ async download(key, isMetadata = false) {
         clearInterval(this.autoSyncInterval);
         this.autoSyncInterval = null;
       }
+
+      this.autoSyncCycleRunning = false;
       this.modalCleanupCallbacks.forEach((cleanup) => {
         try {
           cleanup();
@@ -8453,6 +10161,7 @@ async download(key, isMetadata = false) {
       this.dataService?.cleanup();
       this.cryptoService?.cleanup();
       this.syncOrchestrator?.cleanup();
+      this.backupService?.cleanup();
 
       this.logger.log("success", "✅ Cleanup completed");
       this.config = null;
