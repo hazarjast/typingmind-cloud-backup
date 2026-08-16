@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-16.3";
+const TCS_BUILD_VERSION = "2026-08-16.4";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -3578,13 +3578,23 @@ async download(key, isMetadata = false) {
             if (!existingItem) {
               hasChanged = true;
               changeReason = "new";
-            } else if (currentSize !== existingItem.size) {
+              itemLastModified = now;
+            } else if (
+              currentSize !== existingItem.size
+            ) {
               hasChanged = true;
               changeReason = "size";
               itemLastModified = now;
-            } else if (!existingItem.synced || existingItem.synced === 0) {
+            } else if (
+              !existingItem.synced ||
+              existingItem.synced === 0
+            ) {
               hasChanged = true;
               changeReason = "never-synced";
+
+              if (!itemLastModified) {
+                itemLastModified = now;
+              }
             }
           }
 
