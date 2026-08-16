@@ -3732,13 +3732,36 @@ async download(key, isMetadata = false) {
 
                   const data = await this.storageService.download(path);
 
-                  if (data) {
-                    if (cloudItem.type === "blob") {
-                      data.blobType = cloudItem.blobType || '';
-                      await this.dataService.saveItem(data, "blob", key);
-                    } else {
-                      await this.dataService.saveItem(data, cloudItem.type, key);
-                    }
+                  if (!data) {
+                    throw new Error(
+                      `Downloaded item "${key}" was empty`
+                    );
+                  }
+
+                  let saved;
+
+                  if (cloudItem.type === "blob") {
+                    data.blobType =
+                      cloudItem.blobType ||
+                      "application/octet-stream";
+
+                    saved = await this.dataService.saveItem(
+                      data,
+                      "blob",
+                      key
+                    );
+                  } else {
+                    saved = await this.dataService.saveItem(
+                      data,
+                      cloudItem.type,
+                      key
+                    );
+                  }
+
+                  if (!saved) {
+                    throw new Error(
+                      `Downloaded item "${key}" could not be saved locally`
+                    );
                   }
                 }
                 downloadedCount++;
@@ -4802,11 +4825,36 @@ async download(key, isMetadata = false) {
                 ? `attachments/${key}.bin`
                 : `items/${key}.json`;
               const data = await this.storageService.download(downloadPath);
-              if (cloudItem.type === "blob" && data) {
-                data.blobType = cloudItem.blobType || '';
-                await this.dataService.saveItem(data, "blob", key);
+              if (!data) {
+                throw new Error(
+                  `Cloud item "${key}" was empty`
+                );
+              }
+
+              let saved;
+
+              if (cloudItem.type === "blob") {
+                data.blobType =
+                  cloudItem.blobType ||
+                  "application/octet-stream";
+
+                saved = await this.dataService.saveItem(
+                  data,
+                  "blob",
+                  key
+                );
               } else {
-                await this.dataService.saveItem(data, cloudItem.type, key);
+                saved = await this.dataService.saveItem(
+                  data,
+                  cloudItem.type,
+                  key
+                );
+              }
+
+              if (!saved) {
+                throw new Error(
+                  `Cloud item "${key}" could not be saved locally`
+                );
               }
             }
           });
@@ -5296,7 +5344,68 @@ async download(key, isMetadata = false) {
             );
           }
         }
+        const attachmentsList =
+          await this.storageService.list("attachments/");
 
+        const attachmentsToProcess = attachmentsList.filter(
+          (item) =>
+            item.Key &&
+            item.Key.startsWith("attachments/") &&
+            item.Key.endsWith(".bin")
+        );
+
+        let copiedAttachments = 0;
+
+        for (
+          let i = 0;
+          i < attachmentsToProcess.length;
+          i += concurrency
+        ) {
+          const batch = attachmentsToProcess.slice(
+            i,
+            i + concurrency
+          );
+
+          const copyPromises = batch.map(async (item) => {
+            try {
+              const destinationKey =
+                `${backupFolder}/${item.Key}`;
+
+              await this.storageService.copyObject(
+                item.Key,
+                destinationKey
+              );
+
+              return {
+                success: true,
+                key: item.Key,
+              };
+            } catch (copyError) {
+              this.logger.log(
+                "warning",
+                `Failed to copy attachment ${item.Key}: ` +
+                  getErrorMessage(copyError)
+              );
+
+              return {
+                success: false,
+                key: item.Key,
+                error: getErrorMessage(copyError),
+              };
+            }
+          });
+
+          const batchResults =
+            await Promise.allSettled(copyPromises);
+
+          copiedAttachments += batchResults.filter(
+            (result) =>
+              result.status === "fulfilled" &&
+              result.value?.success
+          ).length;
+
+          await yieldIfInputPending();
+        }
         try {
           const metadataDestination = `${backupFolder}/metadata.json`;
           await this.storageService.copyObject(
@@ -5323,6 +5432,8 @@ async download(key, isMetadata = false) {
           format: "server-side",
           version: "3.0",
           backupFolder: backupFolder,
+          totalAttachments: attachmentsToProcess.length,
+          copiedAttachments: copiedAttachments,
         };
 
         await this.storageService.upload(
@@ -5334,7 +5445,9 @@ async download(key, isMetadata = false) {
 
         this.logger.log(
           "success",
-          `Server-side snapshot created: ${backupFolder} (${copiedItems} items copied)`
+          `Server-side snapshot created: ${backupFolder} ` +
+            `(${copiedItems}/${itemsToProcess.length} items, ` +
+            `${copiedAttachments}/${attachmentsToProcess.length} attachments)`
         );
         return true;
       } catch (error) {
@@ -5450,7 +5563,16 @@ async download(key, isMetadata = false) {
           version: "3.0",
           backupFolder: backupFolder,
         };
-
+        if (
+          copiedItems !== itemsToProcess.length ||
+          copiedAttachments !== attachmentsToProcess.length
+        ) {
+          throw new Error(
+            `Snapshot incomplete: copied ${copiedItems}/` +
+              `${itemsToProcess.length} items and ` +
+              `${copiedAttachments}/${attachmentsToProcess.length} attachments`
+          );
+        }
         await this.storageService.upload(
           `${backupFolder}/backup-manifest.json`,
           manifest,
@@ -8209,7 +8331,7 @@ async loadTombstoneList(modal) {
                 <td class="p-2 font-mono">${itemId}</td>
                 <td class="p-2">${new Date(itemData.deleted).toLocaleString()}</td>
                 <td class="p-2 text-center">
-                    <button class="permanent-delete-btn p-1 text-red-400 hover:text-red-300" data-id="${itemId}" title="Permanently Delete Now">
+                    <button class="permanent-delete-btn p-1 text-red-400 hover:text-red-300" data-id="${itemId}" title="Delete Stored Payload Now">
                         <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"></path></svg>
                     </button>
                 </td>
