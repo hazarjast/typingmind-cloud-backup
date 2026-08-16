@@ -4914,9 +4914,6 @@ async download(key, isMetadata = false) {
         if (importFailCount > 0) {
           throw new Error(
             `Force Import stopped because ${importFailCount} of ` +
-        if (importFailCount > 0) {
-          throw new Error(
-            `Force Import stopped because ${importFailCount} of ` +
               `${importSuccessCount + importFailCount} cloud items failed ` +
               `to download or save. Extraneous local items were not deleted, ` +
               `and local metadata was not replaced.`
@@ -5538,6 +5535,22 @@ async download(key, isMetadata = false) {
           copiedAttachments: copiedAttachments,
         };
 
+        /*
+         * Do not publish a manifest for a partial snapshot. The incomplete
+         * folder may remain in cloud storage, but it will not be advertised
+         * as a valid restorable snapshot.
+         */
+        if (
+          copiedItems !== itemsToProcess.length ||
+          copiedAttachments !== attachmentsToProcess.length
+        ) {
+          throw new Error(
+            `Snapshot incomplete: copied ${copiedItems}/` +
+              `${itemsToProcess.length} items and ` +
+              `${copiedAttachments}/${attachmentsToProcess.length} attachments`
+          );
+        }
+
         await this.storageService.upload(
           `${backupFolder}/backup-manifest.json`,
           manifest,
@@ -5665,16 +5678,6 @@ async download(key, isMetadata = false) {
           version: "3.0",
           backupFolder: backupFolder,
         };
-        if (
-          copiedItems !== itemsToProcess.length ||
-          copiedAttachments !== attachmentsToProcess.length
-        ) {
-          throw new Error(
-            `Snapshot incomplete: copied ${copiedItems}/` +
-              `${itemsToProcess.length} items and ` +
-              `${copiedAttachments}/${attachmentsToProcess.length} attachments`
-          );
-        }
         await this.storageService.upload(
           `${backupFolder}/backup-manifest.json`,
           manifest,
