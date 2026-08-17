@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.1";
+const TCS_BUILD_VERSION = "2026-08-17.2";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -6875,10 +6875,15 @@ async download(key, isMetadata = false) {
     }
 
     async performDailyBackup(lease) {
-      this.logger.log("info", "Starting daily backup (export-style upload)");
+      this.logger.log(
+        "info",
+        "Starting daily backup using cloud-side object copies"
+      );
+
       try {
         await this.ensureSyncIsCurrent();
-        return await this.createDailyBackupFromLocalExport(
+
+        return await this.createDailyBackupFromCloudCopy(
           lease
         );
       } catch (error) {
@@ -6887,6 +6892,7 @@ async download(key, isMetadata = false) {
           "Daily backup failed",
           error.message
         );
+
         throw error;
       }
     }
@@ -6951,6 +6957,393 @@ async download(key, isMetadata = false) {
       }
     }
 
+    /**
+     * Creates a daily backup by copying the synchronized cloud objects.
+     *
+     * Only metadata and manifests are uploaded from the client. Item and
+     * attachment payloads remain encrypted and are copied inside the provider.
+     */
+    async createDailyBackupFromCloudCopy(lease) {
+      if (
+        !lease ||
+        !lease.leaseId ||
+        !lease.backupFolder
+      ) {
+        throw new Error(
+          "Daily backup requires an active cloud lease"
+        );
+      }
+
+      const backupFolder =
+        lease.backupFolder;
+
+      const dateString =
+        lease.date ||
+        this._getUtcDateString();
+
+      await this._assertDailyBackupLeaseOwned(
+        true
+      );
+
+      await this.waitForForegroundSync();
+
+      this.logger.log(
+        "info",
+        `Removing any incomplete cloud-copy backup: ${backupFolder}`
+      );
+
+      await this.storageService.deleteFolder(
+        backupFolder
+      );
+
+      await this._assertDailyBackupLeaseOwned(
+        true
+      );
+
+      /*
+       * Capture the authoritative metadata before copying anything. The
+       * captured copy, rather than a later live metadata.json, is published
+       * inside the backup.
+       */
+      const sourceResponse =
+        await this.storageService.downloadWithResponse(
+          "metadata.json"
+        );
+
+      const sourceMetadata =
+        decodeJsonResponseBody(
+          sourceResponse.Body
+        );
+
+      if (
+        !sourceMetadata ||
+        typeof sourceMetadata !== "object" ||
+        !sourceMetadata.items
+      ) {
+        throw new Error(
+          "Cloud metadata is missing or invalid"
+        );
+      }
+
+      const sourceETag =
+        sourceResponse.ETag || null;
+
+      const activeEntries =
+        Object.entries(
+          sourceMetadata.items
+        ).filter(
+          ([itemId, item]) =>
+            itemId &&
+            item &&
+            !item.deleted &&
+            !itemId.startsWith(
+              "tcs_tombstone_"
+            )
+        );
+
+      const copyPlan =
+        activeEntries.map(
+          ([itemId, item]) => {
+            const relativePath =
+              item.type === "blob"
+                ? `attachments/${itemId}.bin`
+                : `items/${itemId}.json`;
+
+            return {
+              itemId,
+              type: item.type,
+              sourceKey: relativePath,
+              destinationKey:
+                `${backupFolder}/${relativePath}`,
+            };
+          }
+        );
+
+      const attachmentCount =
+        copyPlan.filter(
+          (entry) =>
+            entry.type === "blob"
+        ).length;
+
+      await this.storageService.ensurePathExists(
+        `${backupFolder}/items`
+      );
+
+      if (attachmentCount > 0) {
+        await this.storageService.ensurePathExists(
+          `${backupFolder}/attachments`
+        );
+      }
+
+      await this._renewDailyBackupLease(
+        {
+          phase: "cloud-copy",
+          processedItems: 0,
+          totalItems: copyPlan.length,
+        },
+        true
+      );
+
+      let copiedItems = 0;
+      let copiedAttachments = 0;
+      let lastProgressUpdate = 0;
+
+      const COPY_CONCURRENCY =
+        this.storageService instanceof
+        GoogleDriveService
+          ? 10
+          : 20;
+
+      try {
+        for (
+          let index = 0;
+          index < copyPlan.length;
+          index += COPY_CONCURRENCY
+        ) {
+          await this.waitForForegroundSync();
+          await this._assertDailyBackupLeaseOwned();
+
+          const batch =
+            copyPlan.slice(
+              index,
+              index + COPY_CONCURRENCY
+            );
+
+          const results =
+            await Promise.allSettled(
+              batch.map(async (entry) => {
+                await this.storageService.copyObject(
+                  entry.sourceKey,
+                  entry.destinationKey
+                );
+
+                return entry;
+              })
+            );
+
+          const failure =
+            results.find(
+              (result) =>
+                result.status === "rejected"
+            );
+
+          if (failure) {
+            throw new Error(
+              "Cloud object copy failed: " +
+                getErrorMessage(
+                  failure.reason
+                )
+            );
+          }
+
+          for (const result of results) {
+            if (
+              result.status !== "fulfilled"
+            ) {
+              continue;
+            }
+
+            copiedItems++;
+
+            if (
+              result.value.type === "blob"
+            ) {
+              copiedAttachments++;
+            }
+          }
+
+          if (
+            copiedItems -
+              lastProgressUpdate >=
+              200 ||
+            copiedItems === copyPlan.length
+          ) {
+            lastProgressUpdate =
+              copiedItems;
+
+            await this._renewDailyBackupLease(
+              {
+                phase: "cloud-copy",
+                processedItems:
+                  copiedItems,
+                totalItems:
+                  copyPlan.length,
+              },
+              true
+            );
+
+            this.logger.log(
+              "info",
+              `Daily backup cloud-copy progress: ` +
+                `${copiedItems}/${copyPlan.length}`
+            );
+          }
+
+          await yieldIfInputPending();
+        }
+
+        /*
+         * Refuse to publish a snapshot if metadata changed while its objects
+         * were being copied. A future automatic cycle can retry against the
+         * new synchronized state.
+         */
+        const verificationResponse =
+          await this.storageService.downloadWithResponse(
+            "metadata.json"
+          );
+
+        const verificationMetadata =
+          decodeJsonResponseBody(
+            verificationResponse.Body
+          );
+
+        const verificationETag =
+          verificationResponse.ETag ||
+          null;
+
+        const metadataChanged =
+          sourceETag &&
+          verificationETag
+            ? sourceETag !==
+              verificationETag
+            : JSON.stringify(
+                sourceMetadata
+              ) !==
+              JSON.stringify(
+                verificationMetadata
+              );
+
+        if (metadataChanged) {
+          throw new Error(
+            "Cloud metadata changed during backup; " +
+              "the incomplete snapshot will not be published"
+          );
+        }
+
+        if (
+          copiedItems !== copyPlan.length
+        ) {
+          throw new Error(
+            `Cloud-copy backup incomplete: ` +
+              `${copiedItems}/${copyPlan.length}`
+          );
+        }
+
+        await this._assertDailyBackupLeaseOwned(
+          true
+        );
+
+        await this._renewDailyBackupLease(
+          {
+            phase: "publishing-metadata",
+            processedItems:
+              copiedItems,
+            totalItems:
+              copyPlan.length,
+          },
+          true
+        );
+
+        /*
+         * Upload the captured metadata, not the current live metadata.
+         * This is small and guarantees the backup metadata identifies the
+         * object set selected at the beginning of the operation.
+         */
+        await this.storageService.upload(
+          `${backupFolder}/metadata.json`,
+          sourceMetadata,
+          true
+        );
+
+        const manifest = {
+          type: "daily-backup",
+          name: "daily-auto",
+          date: dateString,
+          created: Date.now(),
+          totalItems: copyPlan.length,
+          copiedItems,
+          totalAttachments:
+            attachmentCount,
+          copiedAttachments,
+          format: "server-side",
+          version: "4.0",
+          backupFolder,
+          leaseId: lease.leaseId,
+          ownerId: lease.ownerId,
+          sourceMetadataETag:
+            sourceETag,
+          sourceLastSync:
+            sourceMetadata.lastSync || 0,
+          buildVersion:
+            TCS_BUILD_VERSION,
+        };
+
+        await this._assertDailyBackupLeaseOwned(
+          true
+        );
+
+        await this._renewDailyBackupLease(
+          {
+            phase: "publishing-manifest",
+            processedItems:
+              copiedItems,
+            totalItems:
+              copyPlan.length,
+          },
+          true
+        );
+
+        await this.storageService.upload(
+          `${backupFolder}/backup-manifest.json`,
+          manifest,
+          true
+        );
+
+        await this._assertDailyBackupLeaseOwned(
+          true
+        );
+
+        await this._addOrUpdateBackupInIndex(
+          manifest
+        );
+
+        this.logger.log(
+          "success",
+          `Daily cloud-copy backup created: ` +
+            `${backupFolder} ` +
+            `(${copiedItems}/${copyPlan.length})`
+        );
+
+        await this.cleanupOldBackups();
+
+        return true;
+      } catch (error) {
+        this.logger.log(
+          "error",
+          "Cloud-copy daily backup failed",
+          getErrorMessage(error)
+        );
+
+        /*
+         * The lease-specific folder cannot belong to another backup, so it
+         * is safe to remove after failure.
+         */
+        try {
+          await this.storageService.deleteFolder(
+            backupFolder
+          );
+        } catch (cleanupError) {
+          this.logger.log(
+            "warning",
+            "Could not remove incomplete cloud-copy backup",
+            getErrorMessage(cleanupError)
+          );
+        }
+
+        throw error;
+      }
+    }
+      
     /**
      * Daily backup implementation that mirrors the UI "Export" path.
      *
@@ -8737,6 +9130,12 @@ async download(key, isMetadata = false) {
       this.leaderElection = null;
       this.autoSyncEnabled = this.getAutoSyncEnabled();
       this.cleanedUp = false;
+
+      this.typingMindWarningObserver =
+        null;
+
+      this.typingMindWarningTimer =
+        null;
     }
 
     getAutoSyncEnabled() {
@@ -8918,6 +9317,8 @@ async download(key, isMetadata = false) {
       });
 
       await this.setupSyncButtonObserver();
+
+      this.setupTypingMindDataWarningFilter();
 
       if (urlConfig.autoOpen || urlConfig.hasParams) {
         this.logger.log(
@@ -9243,6 +9644,295 @@ async download(key, isMetadata = false) {
       return true;
     }
 
+    isThirdPartySyncHealthy() {
+      try {
+        if (
+          !this.storageService ||
+          !this.storageService.isConfigured()
+        ) {
+          return false;
+        }
+
+        const raw =
+          localStorage.getItem(
+            "tcs_sync_diagnostics"
+          );
+
+        if (!raw) {
+          return false;
+        }
+
+        const diagnostics =
+          JSON.parse(raw);
+
+        const countsMatch =
+          diagnostics.localItems ===
+            diagnostics.localMetadata &&
+          diagnostics.localMetadata ===
+            diagnostics.cloudMetadata &&
+          diagnostics.chatSyncLocal ===
+            diagnostics.chatSyncCloud;
+
+        const syncIntervalMs =
+          Math.max(
+            Number(
+              this.config.get(
+                "syncInterval"
+              ) || 60
+            ) * 1000,
+            60000
+          );
+
+        const maximumAge =
+          Math.max(
+            15 * 60 * 1000,
+            syncIntervalMs * 3
+          );
+
+        const lastCloudSync =
+          this.syncOrchestrator
+            ?.getLastCloudSync() || 0;
+
+        const syncIsRecent =
+          lastCloudSync > 0 &&
+          Date.now() -
+            lastCloudSync <=
+            maximumAge;
+
+        return (
+          countsMatch &&
+          syncIsRecent
+        );
+      } catch {
+        return false;
+      }
+    }
+
+    setupTypingMindDataWarningFilter() {
+      const setHidden = (
+        element,
+        hidden
+      ) => {
+        if (!element) {
+          return;
+        }
+
+        if (hidden) {
+          if (
+            !element.dataset
+              .tcsOriginalDisplay
+          ) {
+            element.dataset
+              .tcsOriginalDisplay =
+                element.style.display ||
+                "__empty__";
+          }
+
+          element.dataset
+            .tcsHiddenDataWarning =
+              "1";
+
+          element.style.setProperty(
+            "display",
+            "none",
+            "important"
+          );
+        } else if (
+          element.dataset
+            .tcsHiddenDataWarning ===
+          "1"
+        ) {
+          const original =
+            element.dataset
+              .tcsOriginalDisplay;
+
+          if (
+            original === "__empty__"
+          ) {
+            element.style.removeProperty(
+              "display"
+            );
+          } else {
+            element.style.display =
+              original || "";
+          }
+
+          delete element.dataset
+            .tcsHiddenDataWarning;
+
+          delete element.dataset
+            .tcsOriginalDisplay;
+        }
+      };
+
+      const refresh = () => {
+        const healthy =
+          this.isThirdPartySyncHealthy();
+
+        document
+          .querySelectorAll(
+            '[data-tcs-hidden-data-warning="1"]'
+          )
+          .forEach((element) => {
+            if (!healthy) {
+              setHidden(
+                element,
+                false
+              );
+            }
+          });
+
+        if (!healthy) {
+          return;
+        }
+
+        /*
+         * Hide the popup badge/message using exact text rather than broad
+         * classes that might affect unrelated TypingMind warnings.
+         */
+        const warningElements =
+          Array.from(
+            document.querySelectorAll(
+              "body *"
+            )
+          ).filter((element) => {
+            const text =
+              (
+                element.textContent ||
+                ""
+              )
+                .replace(/\s+/g, " ")
+                .trim();
+
+            if (
+              text !==
+              "Data Lost Warning"
+            ) {
+              return false;
+            }
+
+            return !Array.from(
+              element.children
+            ).some(
+              (child) =>
+                (
+                  child.textContent ||
+                  ""
+                )
+                  .replace(/\s+/g, " ")
+                  .trim() ===
+                "Data Lost Warning"
+            );
+          });
+
+        warningElements.forEach(
+          (element) =>
+            setHidden(
+              element,
+              true
+            )
+        );
+
+        /*
+         * Hide the small red warning marker attached to the lower-left user
+         * button. Location and size checks avoid suppressing general errors.
+         */
+        const viewportHeight =
+          window.innerHeight;
+
+        document
+          .querySelectorAll("button")
+          .forEach((button) => {
+            const buttonRect =
+              button.getBoundingClientRect();
+
+            const isUserButtonArea =
+              buttonRect.left < 100 &&
+              buttonRect.bottom >
+                viewportHeight - 120 &&
+              buttonRect.width <= 90 &&
+              buttonRect.height <= 90;
+
+            if (!isUserButtonArea) {
+              return;
+            }
+
+            button
+              .querySelectorAll(
+                "span, div, svg"
+              )
+              .forEach((candidate) => {
+                const rect =
+                  candidate
+                    .getBoundingClientRect();
+
+                if (
+                  rect.width < 6 ||
+                  rect.height < 6 ||
+                  rect.width > 22 ||
+                  rect.height > 22
+                ) {
+                  return;
+                }
+
+                const style =
+                  getComputedStyle(
+                    candidate
+                  );
+
+                const colors =
+                  [
+                    style.color,
+                    style.backgroundColor,
+                    style.borderColor,
+                  ].join(" ");
+
+                const isRedWarning =
+                  /rgb\(\s*(220|225|239|248),\s*(38|50|68|75),\s*(38|47|55|60)\s*\)/i.test(
+                    colors
+                  ) ||
+                  /#dc2626|#ef4444|#f43f5e/i.test(
+                    colors
+                  );
+
+                if (isRedWarning) {
+                  setHidden(
+                    candidate,
+                    true
+                  );
+                }
+              });
+          });
+      };
+
+      this.typingMindWarningObserver =
+        new MutationObserver(
+          refresh
+        );
+
+      this.typingMindWarningObserver.observe(
+        document.body,
+        {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: [
+            "class",
+            "style",
+            "aria-expanded",
+          ],
+        }
+      );
+
+      this.typingMindWarningTimer =
+        setInterval(
+          refresh,
+          15000
+        );
+
+      refresh();
+    }
+    
     notifyCloudChangesApplied(
       changedItemCount
     ) {
@@ -10788,6 +11478,54 @@ async download(key, isMetadata = false) {
       }
 
       this.autoSyncCycleRunning = false;
+
+      if (
+        this.typingMindWarningObserver
+      ) {
+        this.typingMindWarningObserver.disconnect();
+
+        this.typingMindWarningObserver =
+          null;
+      }
+
+      if (
+        this.typingMindWarningTimer
+      ) {
+        clearInterval(
+          this.typingMindWarningTimer
+        );
+
+        this.typingMindWarningTimer =
+          null;
+      }
+
+      document
+        .querySelectorAll(
+          '[data-tcs-hidden-data-warning="1"]'
+        )
+        .forEach((element) => {
+          const original =
+            element.dataset
+              .tcsOriginalDisplay;
+
+          if (
+            original === "__empty__"
+          ) {
+            element.style.removeProperty(
+              "display"
+            );
+          } else {
+            element.style.display =
+              original || "";
+          }
+
+          delete element.dataset
+            .tcsHiddenDataWarning;
+
+          delete element.dataset
+            .tcsOriginalDisplay;
+        });
+
       this.modalCleanupCallbacks.forEach((cleanup) => {
         try {
           cleanup();
