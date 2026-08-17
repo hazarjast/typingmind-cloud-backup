@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.8";
+const TCS_BUILD_VERSION = "2026-08-17.9";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -10271,75 +10271,6 @@ async download(key, isMetadata = false) {
           normalizeText(text)
         );
 
-      const findAccountPopup =
-        () => {
-          /*
-           * Identify the account popup by several texts unique to that popup.
-           * Do not search for warning text globally because user chats and
-           * code blocks may legitimately contain the same words.
-           */
-          const candidates =
-            Array.from(
-              document.querySelectorAll(
-                "div, section, aside, [role='menu'], [role='dialog']"
-              )
-            ).filter(
-              (element) => {
-                if (
-                  !isVisible(element)
-                ) {
-                  return false;
-                }
-
-                const text =
-                  normalizeText(
-                    element.textContent
-                  );
-
-                return (
-                  text.includes(
-                    "Premium Plan"
-                  ) &&
-                  text.includes(
-                    "Login to TypingMind Cloud"
-                  ) &&
-                  text.includes(
-                    "License Key"
-                  ) &&
-                  text.includes(
-                    "API Keys"
-                  )
-                );
-              }
-            );
-
-          /*
-           * The smallest matching container should be the popup itself,
-           * rather than a larger TypingMind application container.
-           */
-          candidates.sort(
-            (left, right) => {
-              const leftRect =
-                left.getBoundingClientRect();
-
-              const rightRect =
-                right.getBoundingClientRect();
-
-              return (
-                leftRect.width *
-                  leftRect.height -
-                rightRect.width *
-                  rightRect.height
-              );
-            }
-          );
-
-          return (
-            candidates[0] ||
-            null
-          );
-        };
-
       const containsRedColor = (
         style
       ) => {
@@ -10382,102 +10313,49 @@ async download(key, isMetadata = false) {
       };
 
       const hidePopupWarningBadge =
-        (popup) => {
-          if (!popup) {
-            return;
-          }
-
+        () => {
           /*
-           * Search every element type, but only inside the positively
-           * identified account popup.
+           * TypingMind's warning pill currently uses the Tailwind bg-red-700
+           * class. Combining that class with exact warning text avoids
+           * matching chat messages, inline code, or code blocks.
            */
-          const matches =
-            Array.from(
-              popup.querySelectorAll(
-                "*"
-              )
-            ).filter(
+          document
+            .querySelectorAll(
+              '[class~="bg-red-700"]'
+            )
+            .forEach(
               (element) => {
                 if (
                   !isWarningBadgeText(
                     element.textContent
                   )
                 ) {
-                  return false;
+                  return;
                 }
 
+                const rect =
+                  element
+                    .getBoundingClientRect();
+
                 /*
-                 * Retain only the smallest matching element.
+                 * Additional geometry guard: the warning pill is a small UI
+                 * badge, not a large content container.
                  */
-                return !Array.from(
-                  element.children
-                ).some(
-                  (child) =>
-                    isWarningBadgeText(
-                      child.textContent
-                    )
+                if (
+                  rect.width <= 0 ||
+                  rect.height <= 0 ||
+                  rect.width > 300 ||
+                  rect.height > 60
+                ) {
+                  return;
+                }
+
+                setHidden(
+                  element,
+                  true
                 );
               }
             );
-
-          matches.forEach(
-            (match) => {
-              let badge =
-                match;
-
-              let current =
-                match;
-
-              /*
-               * Ascend from the text element and select the outermost small
-               * wrapper whose text is still exactly the warning or whose
-               * styling contains the red badge color.
-               */
-              while (
-                current &&
-                current !== popup
-              ) {
-                const rect =
-                  current
-                    .getBoundingClientRect();
-
-                const isBadgeSized =
-                  rect.width > 0 &&
-                  rect.height > 0 &&
-                  rect.width <= 280 &&
-                  rect.height <= 55;
-
-                if (!isBadgeSized) {
-                  break;
-                }
-
-                const style =
-                  getComputedStyle(
-                    current
-                  );
-
-                if (
-                  isWarningBadgeText(
-                    current.textContent
-                  ) ||
-                  containsRedColor(
-                    style
-                  )
-                ) {
-                  badge =
-                    current;
-                }
-
-                current =
-                  current.parentElement;
-              }
-
-              setHidden(
-                badge,
-                true
-              );
-            }
-          );
         };
 
       const hideWarningTooltip =
@@ -10596,13 +10474,7 @@ async download(key, isMetadata = false) {
           return;
         }
 
-        const popup =
-          findAccountPopup();
-
-        hidePopupWarningBadge(
-          popup
-        );
-
+        hidePopupWarningBadge();
         hideWarningTooltip();
         hideAccountButtonMarker();
       };
