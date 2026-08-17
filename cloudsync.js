@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.7";
+const TCS_BUILD_VERSION = "2026-08-17.8";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -10387,10 +10387,14 @@ async download(key, isMetadata = false) {
             return;
           }
 
+          /*
+           * Search every element type, but only inside the positively
+           * identified account popup.
+           */
           const matches =
             Array.from(
               popup.querySelectorAll(
-                "span, div, button"
+                "*"
               )
             ).filter(
               (element) => {
@@ -10402,6 +10406,9 @@ async download(key, isMetadata = false) {
                   return false;
                 }
 
+                /*
+                 * Retain only the smallest matching element.
+                 */
                 return !Array.from(
                   element.children
                 ).some(
@@ -10415,37 +10422,54 @@ async download(key, isMetadata = false) {
 
           matches.forEach(
             (match) => {
-              /*
-               * Ascend through wrappers only while their complete text remains
-               * exactly the warning label. This hides the whole red pill but
-               * stops before reaching the Premium Plan header.
-               */
               let badge =
                 match;
 
+              let current =
+                match;
+
+              /*
+               * Ascend from the text element and select the outermost small
+               * wrapper whose text is still exactly the warning or whose
+               * styling contains the red badge color.
+               */
               while (
-                badge.parentElement &&
-                popup.contains(
-                  badge.parentElement
-                ) &&
-                isWarningBadgeText(
-                  badge.parentElement
-                    .textContent
-                )
+                current &&
+                current !== popup
               ) {
-                const parentRect =
-                  badge.parentElement
+                const rect =
+                  current
                     .getBoundingClientRect();
 
-                if (
-                  parentRect.width > 260 ||
-                  parentRect.height > 50
-                ) {
+                const isBadgeSized =
+                  rect.width > 0 &&
+                  rect.height > 0 &&
+                  rect.width <= 280 &&
+                  rect.height <= 55;
+
+                if (!isBadgeSized) {
                   break;
                 }
 
-                badge =
-                  badge.parentElement;
+                const style =
+                  getComputedStyle(
+                    current
+                  );
+
+                if (
+                  isWarningBadgeText(
+                    current.textContent
+                  ) ||
+                  containsRedColor(
+                    style
+                  )
+                ) {
+                  badge =
+                    current;
+                }
+
+                current =
+                  current.parentElement;
               }
 
               setHidden(
