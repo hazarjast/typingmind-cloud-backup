@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.2";
+const TCS_BUILD_VERSION = "2026-08-17.3";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -7010,7 +7010,7 @@ async download(key, isMetadata = false) {
           "metadata.json"
         );
 
-      const sourceMetadata =
+      let sourceMetadata =
         decodeJsonResponseBody(
           sourceResponse.Body
         );
@@ -7025,7 +7025,7 @@ async download(key, isMetadata = false) {
         );
       }
 
-      const sourceETag =
+      let sourceETag =
         sourceResponse.ETag || null;
 
       const activeEntries =
@@ -7167,7 +7167,7 @@ async download(key, isMetadata = false) {
                 processedItems:
                   copiedItems,
                 totalItems:
-                  copyPlan.length,
+                  copiedItems,
               },
               true
             );
@@ -7182,52 +7182,303 @@ async download(key, isMetadata = false) {
           await yieldIfInputPending();
         }
 
-        /*
-         * Refuse to publish a snapshot if metadata changed while its objects
-         * were being copied. A future automatic cycle can retry against the
-         * new synchronized state.
-         */
-        const verificationResponse =
-          await this.storageService.downloadWithResponse(
-            "metadata.json"
-          );
-
-        const verificationMetadata =
-          decodeJsonResponseBody(
-            verificationResponse.Body
-          );
-
-        const verificationETag =
-          verificationResponse.ETag ||
-          null;
-
-        const metadataChanged =
-          sourceETag &&
-          verificationETag
-            ? sourceETag !==
-              verificationETag
-            : JSON.stringify(
-                sourceMetadata
-              ) !==
-              JSON.stringify(
-                verificationMetadata
-              );
-
-        if (metadataChanged) {
-          throw new Error(
-            "Cloud metadata changed during backup; " +
-              "the incomplete snapshot will not be published"
-          );
-        }
-
         if (
           copiedItems !== copyPlan.length
         ) {
           throw new Error(
-            `Cloud-copy backup incomplete: ` +
+            `Initial cloud-copy pass incomplete: ` +
               `${copiedItems}/${copyPlan.length}`
           );
         }
+
+        /*
+         * Metadata may legitimately change while thousands of cloud objects
+         * are being copied. Reconcile only the changed objects rather than
+         * discarding and repeating the entire backup.
+         */
+        const getBackupObjectPath = (
+          itemId,
+          item
+        ) => {
+          if (
+            !item ||
+            item.deleted ||
+            itemId.startsWith(
+              "tcs_tombstone_"
+            )
+          ) {
+            return null;
+          }
+
+          return item.type === "blob"
+            ? `attachments/${itemId}.bin`
+            : `items/${itemId}.json`;
+        };
+
+        const metadataEntriesMatch = (
+          left,
+          right
+        ) =>
+          JSON.stringify(left || null) ===
+          JSON.stringify(right || null);
+
+        const MAX_STABILIZATION_PASSES = 5;
+        let metadataStable = false;
+
+        for (
+          let stabilizationPass = 1;
+          stabilizationPass <=
+            MAX_STABILIZATION_PASSES;
+          stabilizationPass++
+        ) {
+          await this.waitForForegroundSync();
+
+          await this._assertDailyBackupLeaseOwned(
+            true
+          );
+
+          const verificationResponse =
+            await this.storageService.downloadWithResponse(
+              "metadata.json"
+            );
+
+          const verificationMetadata =
+            decodeJsonResponseBody(
+              verificationResponse.Body
+            );
+
+          if (
+            !verificationMetadata ||
+            typeof verificationMetadata !==
+              "object" ||
+            !verificationMetadata.items
+          ) {
+            throw new Error(
+              "Cloud metadata became invalid during backup"
+            );
+          }
+
+          const verificationETag =
+            verificationResponse.ETag ||
+            null;
+
+          const metadataChanged =
+            sourceETag &&
+            verificationETag
+              ? sourceETag !==
+                verificationETag
+              : JSON.stringify(
+                  sourceMetadata
+                ) !==
+                JSON.stringify(
+                  verificationMetadata
+                );
+
+          if (!metadataChanged) {
+            metadataStable = true;
+
+            this.logger.log(
+              "success",
+              `Cloud metadata remained stable after ` +
+                `${stabilizationPass} verification pass(es)`
+            );
+
+            break;
+          }
+
+          const previousItems =
+            sourceMetadata.items || {};
+
+          const latestItems =
+            verificationMetadata.items ||
+            {};
+
+          const allItemIds =
+            new Set([
+              ...Object.keys(
+                previousItems
+              ),
+              ...Object.keys(
+                latestItems
+              ),
+            ]);
+
+          const changedItemIds =
+            Array.from(
+              allItemIds
+            ).filter(
+              (itemId) =>
+                !metadataEntriesMatch(
+                  previousItems[itemId],
+                  latestItems[itemId]
+                )
+            );
+
+          this.logger.log(
+            "warning",
+            `Cloud metadata changed during backup; ` +
+              `reconciling ${changedItemIds.length} changed object(s) ` +
+              `(pass ${stabilizationPass}/${MAX_STABILIZATION_PASSES})`
+          );
+
+          const RECONCILE_CONCURRENCY = 10;
+
+          for (
+            let index = 0;
+            index <
+              changedItemIds.length;
+            index +=
+              RECONCILE_CONCURRENCY
+          ) {
+            await this.waitForForegroundSync();
+            await this._assertDailyBackupLeaseOwned();
+
+            const batch =
+              changedItemIds.slice(
+                index,
+                index +
+                  RECONCILE_CONCURRENCY
+              );
+
+            const results =
+              await Promise.allSettled(
+                batch.map(
+                  async (itemId) => {
+                    const previousItem =
+                      previousItems[
+                        itemId
+                      ];
+
+                    const latestItem =
+                      latestItems[
+                        itemId
+                      ];
+
+                    const previousPath =
+                      getBackupObjectPath(
+                        itemId,
+                        previousItem
+                      );
+
+                    const latestPath =
+                      getBackupObjectPath(
+                        itemId,
+                        latestItem
+                      );
+
+                    /*
+                     * Remove an object that was deleted, excluded, or moved
+                     * between the items and attachments namespaces.
+                     */
+                    if (
+                      previousPath &&
+                      previousPath !==
+                        latestPath
+                    ) {
+                      await this.storageService.delete(
+                        `${backupFolder}/${previousPath}`
+                      );
+                    }
+
+                    /*
+                     * Copy the newest encrypted payload. CopyObject overwrites
+                     * the prior destination when the path is unchanged.
+                     */
+                    if (latestPath) {
+                      await this.storageService.copyObject(
+                        latestPath,
+                        `${backupFolder}/${latestPath}`
+                      );
+                    }
+                  }
+                )
+              );
+
+            const failure =
+              results.find(
+                (result) =>
+                  result.status ===
+                  "rejected"
+              );
+
+            if (failure) {
+              throw new Error(
+                "Backup reconciliation failed: " +
+                  getErrorMessage(
+                    failure.reason
+                  )
+              );
+            }
+
+            await yieldIfInputPending();
+          }
+
+          sourceMetadata =
+            verificationMetadata;
+
+          sourceETag =
+            verificationETag;
+
+          await this._renewDailyBackupLease(
+            {
+              phase:
+                "stabilizing-cloud-copy",
+              stabilizationPass,
+              reconciledItems:
+                changedItemIds.length,
+              processedItems:
+                Object.values(
+                  sourceMetadata.items
+                ).filter(
+                  (item) =>
+                    item &&
+                    !item.deleted
+                ).length,
+              totalItems:
+                Object.values(
+                  sourceMetadata.items
+                ).filter(
+                  (item) =>
+                    item &&
+                    !item.deleted
+                ).length,
+            },
+            true
+          );
+        }
+
+        if (!metadataStable) {
+          throw new Error(
+            `Cloud metadata did not stabilize after ` +
+              `${MAX_STABILIZATION_PASSES} reconciliation passes`
+          );
+        }
+
+        /*
+         * Recalculate final counts because items may have been added,
+         * deleted, or changed from ordinary items to attachments.
+         */
+        const finalActiveEntries =
+          Object.entries(
+            sourceMetadata.items
+          ).filter(
+            ([itemId, item]) =>
+              itemId &&
+              item &&
+              !item.deleted &&
+              !itemId.startsWith(
+                "tcs_tombstone_"
+              )
+          );
+
+        copiedItems =
+          finalActiveEntries.length;
+
+        copiedAttachments =
+          finalActiveEntries.filter(
+            ([, item]) =>
+              item.type === "blob"
+          ).length;
 
         await this._assertDailyBackupLeaseOwned(
           true
@@ -7239,7 +7490,7 @@ async download(key, isMetadata = false) {
             processedItems:
               copiedItems,
             totalItems:
-              copyPlan.length,
+              copiedItems,
           },
           true
         );
@@ -7260,10 +7511,10 @@ async download(key, isMetadata = false) {
           name: "daily-auto",
           date: dateString,
           created: Date.now(),
-          totalItems: copyPlan.length,
+          totalItems: copiedItems,
           copiedItems,
           totalAttachments:
-            attachmentCount,
+            copiedAttachments,
           copiedAttachments,
           format: "server-side",
           version: "4.0",
@@ -7288,7 +7539,7 @@ async download(key, isMetadata = false) {
             processedItems:
               copiedItems,
             totalItems:
-              copyPlan.length,
+              copiedItems,
           },
           true
         );
@@ -8260,9 +8511,141 @@ async download(key, isMetadata = false) {
       }
     }
 
+    async _rebuildBackupIndexFromCloud() {
+      this.logger.log(
+        "info",
+        "Rebuilding backup index from cloud manifests"
+      );
+
+      const objects =
+        await this.storageService.list(
+          "backups/"
+        );
+
+      const manifestKeys = [];
+
+      if (
+        this.storageService instanceof
+        GoogleDriveService
+      ) {
+        for (const folder of objects) {
+          if (!folder?.Key) {
+            continue;
+          }
+
+          manifestKeys.push(
+            `${folder.Key.replace(/\/$/, "")}/backup-manifest.json`
+          );
+        }
+      } else {
+        for (const object of objects) {
+          if (
+            object?.Key?.endsWith(
+              "/backup-manifest.json"
+            )
+          ) {
+            manifestKeys.push(
+              object.Key
+            );
+          }
+        }
+      }
+
+      const manifests = [];
+      const concurrency = 20;
+
+      for (
+        let index = 0;
+        index < manifestKeys.length;
+        index += concurrency
+      ) {
+        const batch =
+          manifestKeys.slice(
+            index,
+            index + concurrency
+          );
+
+        const results =
+          await Promise.allSettled(
+            batch.map(async (key) => {
+              const manifest =
+                await this.storageService.download(
+                  key,
+                  true
+                );
+
+              if (
+                !manifest ||
+                !manifest.backupFolder
+              ) {
+                return null;
+              }
+
+              return manifest;
+            })
+          );
+
+        for (const result of results) {
+          if (
+            result.status === "fulfilled" &&
+            result.value
+          ) {
+            manifests.push(
+              result.value
+            );
+          }
+        }
+
+        await yieldIfInputPending();
+      }
+
+      const uniqueManifests =
+        Array.from(
+          new Map(
+            manifests.map(
+              (manifest) => [
+                manifest.backupFolder,
+                manifest,
+              ]
+            )
+          ).values()
+        );
+
+      uniqueManifests.sort(
+        (left, right) =>
+          Number(left.created || 0) -
+          Number(right.created || 0)
+      );
+
+      await this.storageService.upload(
+        this.BACKUP_INDEX_KEY,
+        uniqueManifests,
+        true
+      );
+
+      this.logger.log(
+        "success",
+        `Backup index rebuilt with ` +
+          `${uniqueManifests.length} backup(s)`
+      );
+
+      return uniqueManifests;
+    }
+    
     async _addOrUpdateBackupInIndex(newManifest) {
       try {
-        let index = (await this._getBackupIndex()) || [];
+        let index =
+          await this._getBackupIndex();
+
+        /*
+         * Never replace a missing or corrupted index with a one-entry index.
+         * Recover all discoverable manifests first.
+         */
+        if (index === null) {
+          index =
+            await this._rebuildBackupIndexFromCloud();
+        }
+
         const filteredIndex = index.filter(
           (m) => m.backupFolder !== newManifest.backupFolder
         );
@@ -8315,41 +8698,8 @@ async download(key, isMetadata = false) {
         let manifests = await this._getBackupIndex();
 
         if (manifests === null) {
-          this.logger.log(
-            "info",
-            "Performing one-time scan to build backup index. This may take a moment."
-          );
-          const objects = await this.storageService.list("backups/");
-          const manifestPromises = [];
-
-          if (this.storageService instanceof GoogleDriveService) {
-            for (const folder of objects) {
-              const manifestKey = `${folder.Key}/backup-manifest.json`;
-              manifestPromises.push(
-                this.storageService
-                  .download(manifestKey, true)
-                  .catch(() => null)
-              );
-            }
-          } else {
-            for (const obj of objects) {
-              if (obj.Key.endsWith("/backup-manifest.json")) {
-                manifestPromises.push(
-                  this.storageService.download(obj.Key, true).catch(() => null)
-                );
-              }
-            }
-          }
-          const downloadedManifests = (
-            await Promise.all(manifestPromises)
-          ).filter(Boolean);
-          await this.storageService.upload(
-            this.BACKUP_INDEX_KEY,
-            downloadedManifests,
-            true
-          );
-          this.logger.log("success", "Backup index created from full scan.");
-          manifests = downloadedManifests;
+          manifests =
+            await this._rebuildBackupIndexFromCloud();
         }
 
         const backups = [];
