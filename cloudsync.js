@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.5";
+const TCS_BUILD_VERSION = "2026-08-17.7";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -10236,37 +10236,109 @@ async download(key, isMetadata = false) {
           .replace(/\s+/g, " ")
           .trim();
 
-      const findSmallestTextMatches = (
-        matcher
+      const isVisible = (
+        element
+      ) => {
+        if (!element) {
+          return false;
+        }
+
+        const rect =
+          element.getBoundingClientRect();
+
+        if (
+          rect.width <= 0 ||
+          rect.height <= 0
+        ) {
+          return false;
+        }
+
+        const style =
+          getComputedStyle(
+            element
+          );
+
+        return (
+          style.display !== "none" &&
+          style.visibility !== "hidden"
+        );
+      };
+
+      const isWarningBadgeText = (
+        text
       ) =>
-        Array.from(
-          document.querySelectorAll(
-            "body *"
-          )
-        ).filter((element) => {
-          const text =
-            normalizeText(
-              element.textContent
+        /^(?:⚠️?\s*)?Data Lost Warning$/i.test(
+          normalizeText(text)
+        );
+
+      const findAccountPopup =
+        () => {
+          /*
+           * Identify the account popup by several texts unique to that popup.
+           * Do not search for warning text globally because user chats and
+           * code blocks may legitimately contain the same words.
+           */
+          const candidates =
+            Array.from(
+              document.querySelectorAll(
+                "div, section, aside, [role='menu'], [role='dialog']"
+              )
+            ).filter(
+              (element) => {
+                if (
+                  !isVisible(element)
+                ) {
+                  return false;
+                }
+
+                const text =
+                  normalizeText(
+                    element.textContent
+                  );
+
+                return (
+                  text.includes(
+                    "Premium Plan"
+                  ) &&
+                  text.includes(
+                    "Login to TypingMind Cloud"
+                  ) &&
+                  text.includes(
+                    "License Key"
+                  ) &&
+                  text.includes(
+                    "API Keys"
+                  )
+                );
+              }
             );
 
-          if (!matcher(text)) {
-            return false;
-          }
-
           /*
-           * Keep only the smallest matching descendant. This prevents hiding
-           * the complete account menu when only its warning badge matches.
+           * The smallest matching container should be the popup itself,
+           * rather than a larger TypingMind application container.
            */
-          return !Array.from(
-            element.children
-          ).some((child) =>
-            matcher(
-              normalizeText(
-                child.textContent
-              )
-            )
+          candidates.sort(
+            (left, right) => {
+              const leftRect =
+                left.getBoundingClientRect();
+
+              const rightRect =
+                right.getBoundingClientRect();
+
+              return (
+                leftRect.width *
+                  leftRect.height -
+                rightRect.width *
+                  rightRect.height
+              );
+            }
           );
-        });
+
+          return (
+            candidates[0] ||
+            null
+          );
+        };
 
       const containsRedColor = (
         style
@@ -10309,131 +10381,206 @@ async download(key, isMetadata = false) {
         );
       };
 
-      const refresh = () => {
-        const healthy =
-          this.isThirdPartySyncHealthy();
+      const hidePopupWarningBadge =
+        (popup) => {
+          if (!popup) {
+            return;
+          }
 
-        if (!healthy) {
+          const matches =
+            Array.from(
+              popup.querySelectorAll(
+                "span, div, button"
+              )
+            ).filter(
+              (element) => {
+                if (
+                  !isWarningBadgeText(
+                    element.textContent
+                  )
+                ) {
+                  return false;
+                }
+
+                return !Array.from(
+                  element.children
+                ).some(
+                  (child) =>
+                    isWarningBadgeText(
+                      child.textContent
+                    )
+                );
+              }
+            );
+
+          matches.forEach(
+            (match) => {
+              /*
+               * Ascend through wrappers only while their complete text remains
+               * exactly the warning label. This hides the whole red pill but
+               * stops before reaching the Premium Plan header.
+               */
+              let badge =
+                match;
+
+              while (
+                badge.parentElement &&
+                popup.contains(
+                  badge.parentElement
+                ) &&
+                isWarningBadgeText(
+                  badge.parentElement
+                    .textContent
+                )
+              ) {
+                const parentRect =
+                  badge.parentElement
+                    .getBoundingClientRect();
+
+                if (
+                  parentRect.width > 260 ||
+                  parentRect.height > 50
+                ) {
+                  break;
+                }
+
+                badge =
+                  badge.parentElement;
+              }
+
+              setHidden(
+                badge,
+                true
+              );
+            }
+          );
+        };
+
+      const hideWarningTooltip =
+        () => {
+          /*
+           * Only inspect actual tooltip elements. Never scan arbitrary chat
+           * messages or code blocks for the tooltip's text.
+           */
+          document
+            .querySelectorAll(
+              '[role="tooltip"]'
+            )
+            .forEach(
+              (tooltip) => {
+                const text =
+                  normalizeText(
+                    tooltip.textContent
+                  );
+
+                if (
+                  text.includes(
+                    "Your data is stored locally on this device"
+                  ) &&
+                  text.includes(
+                    "not synced to the cloud"
+                  )
+                ) {
+                  setHidden(
+                    tooltip,
+                    true
+                  );
+                }
+              }
+            );
+        };
+
+      const hideAccountButtonMarker =
+        () => {
+          const viewportHeight =
+            window.innerHeight;
+
+          /*
+           * Search only small navigation buttons near the bottom edge. This
+           * supports layouts where the account button appears on either side.
+           */
+          document
+            .querySelectorAll(
+              "button"
+            )
+            .forEach(
+              (button) => {
+                const buttonRect =
+                  button
+                    .getBoundingClientRect();
+
+                const isBottomNavigationButton =
+                  buttonRect.bottom >
+                    viewportHeight -
+                      130 &&
+                  buttonRect.width > 0 &&
+                  buttonRect.height > 0 &&
+                  buttonRect.width <= 110 &&
+                  buttonRect.height <= 110;
+
+                if (
+                  !isBottomNavigationButton
+                ) {
+                  return;
+                }
+
+                button
+                  .querySelectorAll(
+                    "span, div, svg"
+                  )
+                  .forEach(
+                    (candidate) => {
+                      const rect =
+                        candidate
+                          .getBoundingClientRect();
+
+                      if (
+                        rect.width < 6 ||
+                        rect.height < 6 ||
+                        rect.width > 24 ||
+                        rect.height > 24
+                      ) {
+                        return;
+                      }
+
+                      const style =
+                        getComputedStyle(
+                          candidate
+                        );
+
+                      if (
+                        containsRedColor(
+                          style
+                        )
+                      ) {
+                        setHidden(
+                          candidate,
+                          true
+                        );
+                      }
+                    }
+                  );
+              }
+            );
+        };
+
+      const refresh = () => {
+        if (
+          !this.isThirdPartySyncHealthy()
+        ) {
           restoreSuppressedElements();
           return;
         }
 
-        /*
-         * Hide the red badge in the account popup. Match the phrase instead
-         * of requiring exact text because the warning icon contributes text.
-         */
-        const badgeElements =
-          findSmallestTextMatches(
-            (text) =>
-              /data lost warning/i.test(
-                text
-              )
-          );
+        const popup =
+          findAccountPopup();
 
-        badgeElements.forEach(
-          (element) => {
-            setHidden(
-              element,
-              true
-            );
-          }
+        hidePopupWarningBadge(
+          popup
         );
 
-        /*
-         * Hide the associated tooltip instead of leaving an empty black box.
-         */
-        const tooltipTextElements =
-          findSmallestTextMatches(
-            (text) =>
-              text.includes(
-                "Your data is stored locally on this device"
-              ) &&
-              text.includes(
-                "not synced to the cloud"
-              )
-          );
-
-        tooltipTextElements.forEach(
-          (element) => {
-            const tooltip =
-              element.closest(
-                '[role="tooltip"]'
-              ) ||
-              element.parentElement ||
-              element;
-
-            setHidden(
-              tooltip,
-              true
-            );
-          }
-        );
-
-        /*
-         * Hide the small red marker attached to the account button. Do not
-         * assume the account button is on the left; desktop and mobile layouts
-         * place it on different sides.
-         */
-        const viewportHeight =
-          window.innerHeight;
-
-        document
-          .querySelectorAll("button")
-          .forEach((button) => {
-            const buttonRect =
-              button.getBoundingClientRect();
-
-            const isBottomNavigationButton =
-              buttonRect.bottom >
-                viewportHeight - 140 &&
-              buttonRect.width > 0 &&
-              buttonRect.height > 0 &&
-              buttonRect.width <= 110 &&
-              buttonRect.height <= 110;
-
-            if (
-              !isBottomNavigationButton
-            ) {
-              return;
-            }
-
-            button
-              .querySelectorAll(
-                "span, div, svg"
-              )
-              .forEach(
-                (candidate) => {
-                  const rect =
-                    candidate
-                      .getBoundingClientRect();
-
-                  if (
-                    rect.width < 6 ||
-                    rect.height < 6 ||
-                    rect.width > 24 ||
-                    rect.height > 24
-                  ) {
-                    return;
-                  }
-
-                  const style =
-                    getComputedStyle(
-                      candidate
-                    );
-
-                  if (
-                    containsRedColor(
-                      style
-                    )
-                  ) {
-                    setHidden(
-                      candidate,
-                      true
-                    );
-                  }
-                }
-              );
-          });
+        hideWarningTooltip();
+        hideAccountButtonMarker();
       };
 
       let refreshScheduled =
@@ -10445,7 +10592,8 @@ async download(key, isMetadata = false) {
             return;
           }
 
-          refreshScheduled = true;
+          refreshScheduled =
+            true;
 
           requestAnimationFrame(
             () => {
@@ -10456,6 +10604,12 @@ async download(key, isMetadata = false) {
             }
           );
         };
+
+      /*
+       * Remove state created by an older implementation before installing the
+       * bounded replacement.
+       */
+      restoreSuppressedElements();
 
       if (
         this.typingMindWarningObserver
@@ -10482,11 +10636,6 @@ async download(key, isMetadata = false) {
           childList: true,
           subtree: true,
           attributes: true,
-
-          /*
-           * Do not observe style: this filter itself changes style and would
-           * otherwise trigger unnecessary observer cycles.
-           */
           attributeFilter: [
             "class",
             "aria-expanded",
