@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-16.4";
+const TCS_BUILD_VERSION = "2026-08-17.1";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -3480,6 +3480,131 @@ async download(key, isMetadata = false) {
     }
 
     /**
+     * Returns the most likely TypingMind chat title without relying on one
+     * specific schema version.
+     */
+    getChatTitleValue(chat) {
+      if (
+        !chat ||
+        typeof chat !== "object"
+      ) {
+        return "";
+      }
+
+      const candidates = [
+        chat.title,
+        chat.chatTitle,
+        chat.conversationTitle,
+        chat.topic,
+        chat.subject,
+        chat.name,
+
+        chat.chat?.title,
+        chat.chat?.chatTitle,
+        chat.chat?.name,
+
+        chat.conversation?.title,
+        chat.conversation?.chatTitle,
+        chat.conversation?.name,
+
+        chat.data?.title,
+        chat.data?.chatTitle,
+        chat.data?.name,
+
+        chat.metadata?.title,
+        chat.meta?.title,
+      ];
+
+      for (const candidate of candidates) {
+        if (typeof candidate === "string") {
+          return candidate;
+        }
+      }
+
+      return "";
+    }
+
+    /**
+     * Small deterministic string hash used only for change detection. The
+     * actual title remains inside the encrypted chat payload and is not added
+     * to plaintext metadata.json.
+     */
+    hashChatFingerprintValue(value) {
+      const text = String(value || "");
+
+      let hash = 0x811c9dc5;
+
+      for (let index = 0; index < text.length; index++) {
+        hash ^= text.charCodeAt(index);
+
+        hash = Math.imul(
+          hash,
+          0x01000193
+        );
+      }
+
+      return (
+        hash >>> 0
+      )
+        .toString(16)
+        .padStart(8, "0");
+    }
+
+    getChatTitleFingerprint(chat) {
+      const title =
+        this.getChatTitleValue(chat);
+
+      return (
+        `v1:${title.length}:` +
+        this.hashChatFingerprintValue(
+          title
+        )
+      );
+    }
+
+    /**
+     * Preserve a locally established title baseline when older cloud
+     * metadata does not yet contain chatTitleFingerprint. A real cloud title
+     * fingerprint always wins and is never overwritten here.
+     */
+    preserveLocalChatTitleFingerprints(
+      cloudMetadata
+    ) {
+      if (!cloudMetadata?.items) {
+        return;
+      }
+
+      const localItems =
+        this.metadata?.items || {};
+
+      for (
+        const [
+          itemId,
+          cloudItem,
+        ] of Object.entries(
+          cloudMetadata.items
+        )
+      ) {
+        if (
+          !itemId.startsWith("CHAT_") ||
+          cloudItem.deleted ||
+          cloudItem.chatTitleFingerprint
+        ) {
+          continue;
+        }
+
+        const localFingerprint =
+          localItems[itemId]
+            ?.chatTitleFingerprint;
+
+        if (localFingerprint) {
+          cloudItem.chatTitleFingerprint =
+            localFingerprint;
+        }
+      }
+    }
+
+    /**
      * Detects changes between local storage and the last known sync state.
      * This uses a combined strategy:
      * - For CHAT items (key starts with 'CHAT_'): Uses the `updatedAt` timestamp for fast, memory-safe change detection.
@@ -3488,6 +3613,13 @@ async download(key, isMetadata = false) {
      */
     async detectChanges() {
       const changedItems = [];
+
+      /*
+       * Existing metadata predates chatTitleFingerprint. Establishing that
+       * baseline must not upload every existing chat payload.
+       */
+      let chatTitleBaselineChanged = false;
+
       const now = Date.now();
       const localItemKeys = await this.dataService.getAllItemKeys();
 
@@ -3526,38 +3658,130 @@ async download(key, isMetadata = false) {
           let itemLastModified;
           let currentSize = 0;
 
+          let currentChatTitleFingerprint =
+            null;
+
           if (
             key.startsWith("CHAT_") &&
             item.type === "idb"
           ) {
             const rawUpdatedAt =
-              value.updatedAt || value.updated_at || value.lastUpdated || value.modifiedAt;
-            const rawLastModifiedFromMetadata = existingItem?.lastModified;
+              value.updatedAt ||
+              value.updated_at ||
+              value.lastUpdated ||
+              value.modifiedAt;
 
-            const getNumericTimestamp = (dateValue) => {
-              if (typeof dateValue === "number") return dateValue;
-              if (!dateValue) return 0;
-              const timestamp = new Date(dateValue).getTime();
-              return isNaN(timestamp) ? 0 : timestamp;
-            };
-            const currentTimestamp = getNumericTimestamp(rawUpdatedAt);
-            const lastKnownTimestamp = getNumericTimestamp(rawLastModifiedFromMetadata);
-            const currentFingerprint = this.getChatFingerprint(value);
-            const lastKnownFingerprint = existingItem?.chatFingerprint || "";
-            itemLastModified = currentTimestamp || (existingItem?.lastModified || 0);
+            const rawLastModifiedFromMetadata =
+              existingItem?.lastModified;
+
+            const getNumericTimestamp =
+              (dateValue) => {
+                if (
+                  typeof dateValue ===
+                    "number"
+                ) {
+                  return dateValue;
+                }
+
+                if (!dateValue) {
+                  return 0;
+                }
+
+                const timestamp =
+                  new Date(
+                    dateValue
+                  ).getTime();
+
+                return Number.isFinite(
+                  timestamp
+                )
+                  ? timestamp
+                  : 0;
+              };
+
+            const currentTimestamp =
+              getNumericTimestamp(
+                rawUpdatedAt
+              );
+
+            const lastKnownTimestamp =
+              getNumericTimestamp(
+                rawLastModifiedFromMetadata
+              );
+
+            const currentFingerprint =
+              this.getChatFingerprint(value);
+
+            const lastKnownFingerprint =
+              existingItem
+                ?.chatFingerprint || "";
+
+            currentChatTitleFingerprint =
+              this.getChatTitleFingerprint(
+                value
+              );
+
+            const lastKnownTitleFingerprint =
+              existingItem
+                ?.chatTitleFingerprint || "";
+
+            itemLastModified =
+              currentTimestamp ||
+              existingItem?.lastModified ||
+              0;
+
+            /*
+             * Migration from metadata that predates title fingerprints.
+             * Record the current local title as the baseline without marking
+             * every existing chat payload as changed.
+             */
+            if (
+              existingItem &&
+              !lastKnownTitleFingerprint
+            ) {
+              existingItem
+                .chatTitleFingerprint =
+                  currentChatTitleFingerprint;
+
+              chatTitleBaselineChanged =
+                true;
+            }
+
             if (!existingItem) {
               hasChanged = true;
               changeReason = "new-chat";
-            } else if (currentTimestamp && currentTimestamp > lastKnownTimestamp) {
+              itemLastModified =
+                currentTimestamp || now;
+            } else if (
+              currentTimestamp &&
+              currentTimestamp >
+                lastKnownTimestamp
+            ) {
               hasChanged = true;
               changeReason = "timestamp";
-            } else if (currentFingerprint && currentFingerprint !== lastKnownFingerprint) {
+            } else if (
+              currentFingerprint &&
+              currentFingerprint !==
+                lastKnownFingerprint
+            ) {
               hasChanged = true;
               changeReason = "fingerprint";
-            } else if (!existingItem.synced || existingItem.synced === 0) {
-             hasChanged = true;
-             changeReason = "never-synced-chat";
-             itemLastModified = now;
+            } else if (
+              lastKnownTitleFingerprint &&
+              currentChatTitleFingerprint !==
+                lastKnownTitleFingerprint
+            ) {
+              hasChanged = true;
+              changeReason = "title";
+              itemLastModified = now;
+            } else if (
+              !existingItem.synced ||
+              existingItem.synced === 0
+            ) {
+              hasChanged = true;
+              changeReason =
+                "never-synced-chat";
+              itemLastModified = now;
             }
           } else {
             if (value instanceof Blob) {
@@ -3605,8 +3829,20 @@ async download(key, isMetadata = false) {
               lastModified: itemLastModified,
               reason: changeReason,
             };
-            if (key.startsWith("CHAT_") && item.type === "idb") {
-              change.chatFingerprint = this.getChatFingerprint(value);
+            if (
+              key.startsWith("CHAT_") &&
+              item.type === "idb"
+            ) {
+              change.chatFingerprint =
+                this.getChatFingerprint(
+                  value
+                );
+
+              change.chatTitleFingerprint =
+                currentChatTitleFingerprint ||
+                this.getChatTitleFingerprint(
+                  value
+                );
             }
             if (item.type === 'blob' && value instanceof Blob) {
             change.blobType = value.type || '';
@@ -3674,7 +3910,20 @@ async download(key, isMetadata = false) {
         );
       }
 
-      return { changedItems, hasChanges: changedItems.length > 0 };
+      if (chatTitleBaselineChanged) {
+        /*
+         * Persist only the lightweight title hashes. Existing chat payloads
+         * are not uploaded during this migration.
+         */
+        this.saveMetadata();
+      }
+
+      return {
+        changedItems,
+        hasChanges:
+          changedItems.length > 0,
+        chatTitleBaselineChanged,
+      };
     }
 
     /**
@@ -3706,7 +3955,17 @@ async download(key, isMetadata = false) {
           this.currentCloudMetadata ||
           (await this.getCloudMetadata());
 
-        this.currentCloudMetadata = cloudMetadata;
+        /*
+         * Copy locally established title baselines into the metadata object
+         * that will be uploaded if this sync has other changes.
+         */
+        this.preserveLocalChatTitleFingerprints(
+          cloudMetadata
+        );
+
+        this.currentCloudMetadata =
+          cloudMetadata;
+
         let itemsSynced = 0;
 
         // Encryption/compression is CPU and memory intensive. Two concurrent
@@ -3766,8 +4025,23 @@ async download(key, isMetadata = false) {
                   lastModified: item.lastModified,
                 };
 
-                if (item.id.startsWith("CHAT_") && item.type === "idb") {
-                  newMetadataEntry.chatFingerprint = item.chatFingerprint || this.getChatFingerprint(data);
+                if (
+                  item.id.startsWith("CHAT_") &&
+                  item.type === "idb"
+                ) {
+                  newMetadataEntry
+                    .chatFingerprint =
+                      item.chatFingerprint ||
+                      this.getChatFingerprint(
+                        data
+                      );
+
+                  newMetadataEntry
+                    .chatTitleFingerprint =
+                      item.chatTitleFingerprint ||
+                      this.getChatTitleFingerprint(
+                        data
+                      );
                 }
 
                 if (item.type === "blob") {         
@@ -3883,8 +4157,21 @@ async download(key, isMetadata = false) {
       }
       this.syncInProgress = true;
       try {
-        const { metadata: cloudMetadata, etag: cloudMetadataETag } =
-          await this.getCloudMetadataWithETag();
+        const {
+          metadata: cloudMetadata,
+          etag: cloudMetadataETag,
+        } =
+          await this
+            .getCloudMetadataWithETag();
+
+        /*
+         * Older cloud metadata has no title fingerprints. Preserve locally
+         * established baselines until each chat gets updated naturally.
+         */
+        this.preserveLocalChatTitleFingerprints(
+          cloudMetadata
+        );
+
         // Reuse this exact snapshot throughout the current full-sync cycle.
         // Do not fetch metadata.json two or three more times immediately.
         this.currentCloudMetadata = cloudMetadata;
@@ -3985,9 +4272,36 @@ async download(key, isMetadata = false) {
               return true;
             }
             if (key.startsWith("CHAT_")) {
-              const cloudFp = cloudItem.chatFingerprint || "";
-              const localFp = localItem?.chatFingerprint || "";
-              if (cloudFp && cloudFp !== localFp) {
+              const cloudFp =
+                cloudItem
+                  .chatFingerprint || "";
+
+              const localFp =
+                localItem
+                  ?.chatFingerprint || "";
+
+              if (
+                cloudFp &&
+                cloudFp !== localFp
+              ) {
+                return true;
+              }
+
+              const cloudTitleFp =
+                cloudItem
+                  .chatTitleFingerprint ||
+                "";
+
+              const localTitleFp =
+                localItem
+                  ?.chatTitleFingerprint ||
+                "";
+
+              if (
+                cloudTitleFp &&
+                cloudTitleFp !==
+                  localTitleFp
+              ) {
                 return true;
               }
             }
@@ -4139,8 +4453,21 @@ async download(key, isMetadata = false) {
         this.setLastCloudSync(cloudLastSync);
         localStorage.setItem("tcs_metadata_etag", cloudMetadataETag);
         this.saveMetadata();
+
         await this.updateSyncDiagnosticsCache();
-        this.logger.log("success", "Sync from cloud completed");
+
+        if (downloadedCount > 0) {
+          window.cloudSyncApp
+            ?.notifyCloudChangesApplied(
+              downloadedCount
+            );
+        }
+
+        this.logger.log(
+          "success",
+          "Sync from cloud completed"
+        );
+
         return metadataWasPurged;
       } catch (error) {
         this.logger.log("error", "Failed to sync from cloud", error.message);
@@ -4251,7 +4578,15 @@ async download(key, isMetadata = false) {
                     item.data?.updatedAt || now;
 
                   newMetadataEntry.chatFingerprint =
-                    this.getChatFingerprint(item.data);
+                    this.getChatFingerprint(
+                      item.data
+                    );
+
+                  newMetadataEntry
+                    .chatTitleFingerprint =
+                      this.getChatTitleFingerprint(
+                        item.data
+                      );
                 } else {
                   newMetadataEntry.size =
                     this.getItemSize(item.data);
@@ -4482,7 +4817,15 @@ async download(key, isMetadata = false) {
                 item.data?.updatedAt || 0;
 
               baseEntry.chatFingerprint =
-                this.getChatFingerprint(item.data);
+                this.getChatFingerprint(
+                  item.data
+                );
+
+              baseEntry
+                .chatTitleFingerprint =
+                  this.getChatTitleFingerprint(
+                    item.data
+                  );
             }
             this.metadata.items[key] = baseEntry;
             itemCount++;
@@ -4584,6 +4927,17 @@ async download(key, isMetadata = false) {
                     ].chatFingerprint =
                       cloudItem.chatFingerprint;
                   }
+
+                  if (
+                    cloudItem.chatTitleFingerprint
+                  ) {
+                    this.metadata.items[
+                      cloudItemId
+                    ].chatTitleFingerprint =
+                      cloudItem
+                        .chatTitleFingerprint;
+                  }
+
                   restoredCount++;
                   this.logger.log(
                     "info",
@@ -5425,8 +5779,19 @@ async download(key, isMetadata = false) {
               item.type === "idb" &&
               item.data?.updatedAt
             ) {
-              metadataEntry.lastModified = item.data.updatedAt;
-              metadataEntry.chatFingerprint = this.getChatFingerprint(item.data);
+              metadataEntry.lastModified =
+                item.data.updatedAt;
+
+              metadataEntry.chatFingerprint =
+                this.getChatFingerprint(
+                  item.data
+                );
+
+              metadataEntry
+                .chatTitleFingerprint =
+                  this.getChatTitleFingerprint(
+                    item.data
+                  );
             } else {
               metadataEntry.size = this.getItemSize(item.data);
               metadataEntry.lastModified = now;
@@ -6968,6 +7333,19 @@ async download(key, isMetadata = false) {
                     .getChatFingerprint(
                       item.data
                     );
+
+                if (
+                  typeof orchestrator
+                    .getChatTitleFingerprint ===
+                  "function"
+                ) {
+                  metadataEntry
+                    .chatTitleFingerprint =
+                      orchestrator
+                        .getChatTitleFingerprint(
+                          item.data
+                        );
+                }
               }
             } else {
               if (
@@ -8865,7 +9243,138 @@ async download(key, isMetadata = false) {
       return true;
     }
 
+    notifyCloudChangesApplied(
+      changedItemCount
+    ) {
+      if (
+        !changedItemCount ||
+        changedItemCount < 1
+      ) {
+        return;
+      }
 
+      let notification =
+        document.getElementById(
+          "tcs-cloud-refresh-notification"
+        );
+
+      if (!notification) {
+        notification =
+          document.createElement("div");
+
+        notification.id =
+          "tcs-cloud-refresh-notification";
+
+        notification.style.cssText = [
+          "position:fixed",
+          "right:16px",
+          "bottom:16px",
+          "z-index:100000",
+          "max-width:360px",
+          "padding:12px",
+          "border-radius:8px",
+          "background:#27272a",
+          "color:#fff",
+          "border:1px solid #52525b",
+          "box-shadow:0 12px 30px rgba(0,0,0,.35)",
+          "font-size:13px",
+        ].join(";");
+
+        const message =
+          document.createElement("div");
+
+        message.className =
+          "tcs-cloud-refresh-message";
+
+        message.style.marginBottom =
+          "10px";
+
+        const actions =
+          document.createElement("div");
+
+        actions.style.cssText =
+          "display:flex;gap:8px;justify-content:flex-end";
+
+        const laterButton =
+          document.createElement("button");
+
+        laterButton.type =
+          "button";
+
+        laterButton.textContent =
+          "Later";
+
+        laterButton.style.cssText = [
+          "padding:5px 10px",
+          "border-radius:6px",
+          "background:#52525b",
+          "color:white",
+          "border:0",
+          "cursor:pointer",
+        ].join(";");
+
+        laterButton.addEventListener(
+          "click",
+          () => notification.remove()
+        );
+
+        const reloadButton =
+          document.createElement("button");
+
+        reloadButton.type =
+          "button";
+
+        reloadButton.textContent =
+          "Reload";
+
+        reloadButton.style.cssText = [
+          "padding:5px 10px",
+          "border-radius:6px",
+          "background:#2563eb",
+          "color:white",
+          "border:0",
+          "cursor:pointer",
+        ].join(";");
+
+        reloadButton.addEventListener(
+          "click",
+          () =>
+            window.location.reload()
+        );
+
+        actions.appendChild(
+          laterButton
+        );
+
+        actions.appendChild(
+          reloadButton
+        );
+
+        notification.appendChild(
+          message
+        );
+
+        notification.appendChild(
+          actions
+        );
+
+        document.body.appendChild(
+          notification
+        );
+      }
+
+      const message =
+        notification.querySelector(
+          ".tcs-cloud-refresh-message"
+        );
+
+      if (message) {
+        message.textContent =
+          `${changedItemCount} cloud item` +
+          `${changedItemCount === 1 ? "" : "s"} ` +
+          `updated locally. Reload TypingMind to refresh the chat list.`;
+      }
+    }
 
     updateSyncStatus(status = "success") {
       this._tcsSyncLastStatus = status;
