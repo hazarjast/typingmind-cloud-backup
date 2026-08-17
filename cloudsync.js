@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.9";
+const TCS_BUILD_VERSION = "2026-08-17.10";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -6071,6 +6071,9 @@ async download(key, isMetadata = false) {
 
       this._dailyBackupRunning = false;
 
+      this.mobileDailyBackupSkipLogged =
+        false;
+
       /*
        * Retained for migration compatibility. The cloud lease is now the
        * authoritative cross-device lock.
@@ -6119,6 +6122,60 @@ async download(key, isMetadata = false) {
 
       this.deviceId = deviceId;
     }
+    _isLikelyMobileClient() {
+      /*
+       * Local override for testing or installations where a mobile device
+       * should remain eligible to perform automatic daily backups.
+       */
+      if (
+        localStorage.getItem(
+          "tcs_allow_mobile_daily_backup"
+        ) === "true"
+      ) {
+        return false;
+      }
+
+      /*
+       * Chromium-based browsers may expose the low-entropy mobile Client
+       * Hint. Safari currently requires the fallback checks below.
+       */
+      if (
+        navigator.userAgentData
+          ?.mobile === true
+      ) {
+        return true;
+      }
+
+      const userAgent =
+        String(
+          navigator.userAgent || ""
+        );
+
+      const mobileUserAgent =
+        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(
+          userAgent
+        );
+
+      if (mobileUserAgent) {
+        return true;
+      }
+
+      /*
+       * Modern iPadOS may identify itself as Macintosh when requesting the
+       * desktop version of a site. Multiple touch points distinguish it from
+       * an ordinary Mac in most practical cases.
+       */
+      const isModernIPad =
+        navigator.platform ===
+          "MacIntel" &&
+        Number(
+          navigator.maxTouchPoints ||
+            0
+        ) > 1;
+
+      return isModernIPad;
+    }
+
     _getUtcDateString() {
       return new Date().toISOString().slice(0, 10).replace(/-/g, "");
     }
@@ -6747,6 +6804,43 @@ async download(key, isMetadata = false) {
           "skip",
           "Storage provider not configured, skipping daily backup."
         );
+
+        return false;
+      }
+
+      /*
+       * Mobile browsers and installed mobile PWAs are frequently suspended
+       * before a multi-minute backup can complete. Leave daily-backup lease
+       * acquisition to an eligible desktop installation.
+       */
+      if (
+        this._isLikelyMobileClient()
+      ) {
+        if (
+          !this.mobileDailyBackupSkipLogged
+        ) {
+          this.mobileDailyBackupSkipLogged =
+            true;
+
+          this.logger.log(
+            "skip",
+            "Automatic daily backups are disabled on mobile clients. " +
+              "Normal sync and manual snapshots remain available.",
+            {
+              userAgent:
+                navigator.userAgent,
+              platform:
+                navigator.platform,
+              touchPoints:
+                navigator.maxTouchPoints ||
+                0,
+              userAgentDataMobile:
+                navigator.userAgentData
+                  ?.mobile ??
+                null,
+            }
+          );
+        }
 
         return false;
       }
@@ -9098,6 +9192,10 @@ async download(key, isMetadata = false) {
       this._stopDailyBackupLeaseHeartbeat();
 
       this._dailyBackupRunning = false;
+
+      this.mobileDailyBackupSkipLogged =
+        false;
+
       this.activeDailyBackupLease = null;
       this.lastDailyLeaseVerificationAt = 0;
       this.conditionalLeaseWarningShown =
