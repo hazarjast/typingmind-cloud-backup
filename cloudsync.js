@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.3";
+const TCS_BUILD_VERSION = "2026-08-17.4";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -9897,6 +9897,13 @@ async download(key, isMetadata = false) {
         .cloud-sync-modal label {
           color: #d4d4d8 !important;
         }
+
+        #backup-files {
+          cursor: pointer;
+          appearance: auto !important;
+          -webkit-appearance: menulist !important;
+          padding-right: 2rem !important;
+        }
         `;
         document.head.appendChild(style);
       }
@@ -11226,6 +11233,23 @@ async download(key, isMetadata = false) {
           option.text = "No backups found";
           backupList.appendChild(option);
         } else {
+          const placeholder =
+            document.createElement(
+              "option"
+            );
+
+          placeholder.value = "";
+
+          placeholder.textContent =
+            `${backups.length} backups available — click to select`;
+
+          placeholder.disabled = true;
+          placeholder.selected = true;
+
+          backupList.appendChild(
+            placeholder
+          );
+
           backups.forEach((backup) => {
             const option = document.createElement("option");
             option.value = backup.key;
