@@ -22,7 +22,7 @@ Contributors (Docs & Fixes):
 - Jeff G aka Ken Harris (Various fixes and improvements) [2026-03-04]
 */
 
-const TCS_BUILD_VERSION = "2026-08-17.4";
+const TCS_BUILD_VERSION = "2026-08-17.5";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -4675,7 +4675,17 @@ async download(key, isMetadata = false) {
 
       this.fullSyncPromise = this._performFullSyncInternal()
         .then((result) => {
-          this.lastSuccessfulFullSyncAt = Date.now();
+          const completedAt =
+            Date.now();
+
+          this.lastSuccessfulFullSyncAt =
+            completedAt;
+
+          localStorage.setItem(
+            "tcs_last-successful-full-sync",
+            String(completedAt)
+          );
+
           return result;
         })
         .finally(() => {
@@ -7167,7 +7177,7 @@ async download(key, isMetadata = false) {
                 processedItems:
                   copiedItems,
                 totalItems:
-                  copiedItems,
+                  copyPlan.length,
               },
               true
             );
@@ -7471,14 +7481,27 @@ async download(key, isMetadata = false) {
               )
           );
 
-        copiedItems =
-          finalActiveEntries.length;
-
-        copiedAttachments =
+        const finalAttachmentEntries =
           finalActiveEntries.filter(
             ([, item]) =>
               item.type === "blob"
-          ).length;
+          );
+
+        const finalItemEntries =
+          finalActiveEntries.filter(
+            ([, item]) =>
+              item.type !== "blob"
+          );
+
+        copiedItems =
+          finalItemEntries.length;
+
+        copiedAttachments =
+          finalAttachmentEntries.length;
+
+        const copiedObjects =
+          copiedItems +
+          copiedAttachments;
 
         await this._assertDailyBackupLeaseOwned(
           true
@@ -7511,11 +7534,18 @@ async download(key, isMetadata = false) {
           name: "daily-auto",
           date: dateString,
           created: Date.now(),
-          totalItems: copiedItems,
+          totalItems:
+            copiedItems,
+
           copiedItems,
+
           totalAttachments:
             copiedAttachments,
+
           copiedAttachments,
+
+          totalObjects:
+            copiedObjects,
           format: "server-side",
           version: "4.0",
           backupFolder,
@@ -7562,7 +7592,7 @@ async download(key, isMetadata = false) {
           "success",
           `Daily cloud-copy backup created: ` +
             `${backupFolder} ` +
-            `(${copiedItems}/${copyPlan.length})`
+            `(${copiedObjects}/${copyPlan.length} objects)`
         );
 
         await this.cleanupOldBackups();
@@ -8714,8 +8744,21 @@ async download(key, isMetadata = false) {
               displayName: backupName,
               modified: new Date(manifest.created),
               format: "server-side",
-              totalItems: manifest.totalItems,
-              copiedItems: manifest.copiedItems,
+              totalItems:
+                manifest.totalItems,
+
+              copiedItems:
+                manifest.copiedItems,
+
+              totalAttachments:
+                manifest.totalAttachments,
+
+              copiedAttachments:
+                manifest.copiedAttachments,
+
+              totalObjects:
+                manifest.totalObjects,
+
               type: backupType,
               backupFolder: backupFolder,
               sortOrder: backupType === "snapshot" ? 1 : 2,
@@ -10005,7 +10048,8 @@ async download(key, isMetadata = false) {
       try {
         if (
           !this.storageService ||
-          !this.storageService.isConfigured()
+          !this.storageService.isConfigured() ||
+          !this.syncOrchestrator
         ) {
           return false;
         }
@@ -10030,6 +10074,33 @@ async download(key, isMetadata = false) {
           diagnostics.chatSyncLocal ===
             diagnostics.chatSyncCloud;
 
+        if (!countsMatch) {
+          return false;
+        }
+
+        const now =
+          Date.now();
+
+        const inMemorySuccess =
+          Number(
+            this.syncOrchestrator
+              .lastSuccessfulFullSyncAt ||
+              0
+          );
+
+        const persistedSuccess =
+          Number(
+            localStorage.getItem(
+              "tcs_last-successful-full-sync"
+            ) || "0"
+          );
+
+        const lastSuccessfulCheck =
+          Math.max(
+            inMemorySuccess,
+            persistedSuccess
+          );
+
         const syncIntervalMs =
           Math.max(
             Number(
@@ -10040,25 +10111,38 @@ async download(key, isMetadata = false) {
             60000
           );
 
+        /*
+         * Auto-sync should have checked recently. When auto-sync is disabled,
+         * retain healthy status for 24 hours after a successful manual sync.
+         */
         const maximumAge =
-          Math.max(
-            15 * 60 * 1000,
-            syncIntervalMs * 3
+          this.autoSyncEnabled
+            ? Math.max(
+                15 * 60 * 1000,
+                syncIntervalMs * 3
+              )
+            : 24 * 60 * 60 * 1000;
+
+        const successfulCheckIsRecent =
+          lastSuccessfulCheck > 0 &&
+          now -
+            lastSuccessfulCheck <=
+            maximumAge;
+
+        const diagnosticsTimestamp =
+          Number(
+            diagnostics.timestamp || 0
           );
 
-        const lastCloudSync =
-          this.syncOrchestrator
-            ?.getLastCloudSync() || 0;
-
-        const syncIsRecent =
-          lastCloudSync > 0 &&
-          Date.now() -
-            lastCloudSync <=
+        const diagnosticsAreRecent =
+          diagnosticsTimestamp > 0 &&
+          now -
+            diagnosticsTimestamp <=
             maximumAge;
 
         return (
-          countsMatch &&
-          syncIsRecent
+          successfulCheckIsRecent &&
+          diagnosticsAreRecent
         );
       } catch {
         return false;
@@ -10076,14 +10160,17 @@ async download(key, isMetadata = false) {
 
         if (hidden) {
           if (
-            !element.dataset
-              .tcsOriginalDisplay
-          ) {
             element.dataset
-              .tcsOriginalDisplay =
-                element.style.display ||
-                "__empty__";
+              .tcsHiddenDataWarning ===
+            "1"
+          ) {
+            return;
           }
+
+          element.dataset
+            .tcsOriginalDisplay =
+              element.style.display ||
+              "__empty__";
 
           element.dataset
             .tcsHiddenDataWarning =
@@ -10094,105 +10181,198 @@ async download(key, isMetadata = false) {
             "none",
             "important"
           );
-        } else if (
+
+          return;
+        }
+
+        if (
           element.dataset
-            .tcsHiddenDataWarning ===
+            .tcsHiddenDataWarning !==
           "1"
         ) {
-          const original =
-            element.dataset
-              .tcsOriginalDisplay;
+          return;
+        }
 
-          if (
-            original === "__empty__"
-          ) {
-            element.style.removeProperty(
-              "display"
+        const original =
+          element.dataset
+            .tcsOriginalDisplay;
+
+        if (
+          original === "__empty__"
+        ) {
+          element.style.removeProperty(
+            "display"
+          );
+        } else {
+          element.style.display =
+            original || "";
+        }
+
+        delete element.dataset
+          .tcsHiddenDataWarning;
+
+        delete element.dataset
+          .tcsOriginalDisplay;
+      };
+
+      const restoreSuppressedElements =
+        () => {
+          document
+            .querySelectorAll(
+              '[data-tcs-hidden-data-warning="1"]'
+            )
+            .forEach((element) => {
+              setHidden(
+                element,
+                false
+              );
+            });
+        };
+
+      const normalizeText = (
+        value
+      ) =>
+        String(value || "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      const findSmallestTextMatches = (
+        matcher
+      ) =>
+        Array.from(
+          document.querySelectorAll(
+            "body *"
+          )
+        ).filter((element) => {
+          const text =
+            normalizeText(
+              element.textContent
             );
-          } else {
-            element.style.display =
-              original || "";
+
+          if (!matcher(text)) {
+            return false;
           }
 
-          delete element.dataset
-            .tcsHiddenDataWarning;
+          /*
+           * Keep only the smallest matching descendant. This prevents hiding
+           * the complete account menu when only its warning badge matches.
+           */
+          return !Array.from(
+            element.children
+          ).some((child) =>
+            matcher(
+              normalizeText(
+                child.textContent
+              )
+            )
+          );
+        });
 
-          delete element.dataset
-            .tcsOriginalDisplay;
-        }
+      const containsRedColor = (
+        style
+      ) => {
+        const values = [
+          style.color,
+          style.backgroundColor,
+          style.borderColor,
+          style.fill,
+          style.stroke,
+        ];
+
+        return values.some(
+          (value) => {
+            const match =
+              String(value || "")
+                .match(
+                  /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i
+                );
+
+            if (!match) {
+              return false;
+            }
+
+            const red =
+              Number(match[1]);
+
+            const green =
+              Number(match[2]);
+
+            const blue =
+              Number(match[3]);
+
+            return (
+              red >= 180 &&
+              green <= 110 &&
+              blue <= 110
+            );
+          }
+        );
       };
 
       const refresh = () => {
         const healthy =
           this.isThirdPartySyncHealthy();
 
-        document
-          .querySelectorAll(
-            '[data-tcs-hidden-data-warning="1"]'
-          )
-          .forEach((element) => {
-            if (!healthy) {
-              setHidden(
-                element,
-                false
-              );
-            }
-          });
-
         if (!healthy) {
+          restoreSuppressedElements();
           return;
         }
 
         /*
-         * Hide the popup badge/message using exact text rather than broad
-         * classes that might affect unrelated TypingMind warnings.
+         * Hide the red badge in the account popup. Match the phrase instead
+         * of requiring exact text because the warning icon contributes text.
          */
-        const warningElements =
-          Array.from(
-            document.querySelectorAll(
-              "body *"
-            )
-          ).filter((element) => {
-            const text =
-              (
-                element.textContent ||
-                ""
+        const badgeElements =
+          findSmallestTextMatches(
+            (text) =>
+              /data lost warning/i.test(
+                text
               )
-                .replace(/\s+/g, " ")
-                .trim();
+          );
 
-            if (
-              text !==
-              "Data Lost Warning"
-            ) {
-              return false;
-            }
-
-            return !Array.from(
-              element.children
-            ).some(
-              (child) =>
-                (
-                  child.textContent ||
-                  ""
-                )
-                  .replace(/\s+/g, " ")
-                  .trim() ===
-                "Data Lost Warning"
-            );
-          });
-
-        warningElements.forEach(
-          (element) =>
+        badgeElements.forEach(
+          (element) => {
             setHidden(
               element,
               true
-            )
+            );
+          }
         );
 
         /*
-         * Hide the small red warning marker attached to the lower-left user
-         * button. Location and size checks avoid suppressing general errors.
+         * Hide the associated tooltip instead of leaving an empty black box.
+         */
+        const tooltipTextElements =
+          findSmallestTextMatches(
+            (text) =>
+              text.includes(
+                "Your data is stored locally on this device"
+              ) &&
+              text.includes(
+                "not synced to the cloud"
+              )
+          );
+
+        tooltipTextElements.forEach(
+          (element) => {
+            const tooltip =
+              element.closest(
+                '[role="tooltip"]'
+              ) ||
+              element.parentElement ||
+              element;
+
+            setHidden(
+              tooltip,
+              true
+            );
+          }
+        );
+
+        /*
+         * Hide the small red marker attached to the account button. Do not
+         * assume the account button is on the left; desktop and mobile layouts
+         * place it on different sides.
          */
         const viewportHeight =
           window.innerHeight;
@@ -10203,14 +10383,17 @@ async download(key, isMetadata = false) {
             const buttonRect =
               button.getBoundingClientRect();
 
-            const isUserButtonArea =
-              buttonRect.left < 100 &&
+            const isBottomNavigationButton =
               buttonRect.bottom >
-                viewportHeight - 120 &&
-              buttonRect.width <= 90 &&
-              buttonRect.height <= 90;
+                viewportHeight - 140 &&
+              buttonRect.width > 0 &&
+              buttonRect.height > 0 &&
+              buttonRect.width <= 110 &&
+              buttonRect.height <= 110;
 
-            if (!isUserButtonArea) {
+            if (
+              !isBottomNavigationButton
+            ) {
               return;
             }
 
@@ -10218,53 +10401,79 @@ async download(key, isMetadata = false) {
               .querySelectorAll(
                 "span, div, svg"
               )
-              .forEach((candidate) => {
-                const rect =
-                  candidate
-                    .getBoundingClientRect();
-
-                if (
-                  rect.width < 6 ||
-                  rect.height < 6 ||
-                  rect.width > 22 ||
-                  rect.height > 22
-                ) {
-                  return;
-                }
-
-                const style =
-                  getComputedStyle(
+              .forEach(
+                (candidate) => {
+                  const rect =
                     candidate
-                  );
+                      .getBoundingClientRect();
 
-                const colors =
-                  [
-                    style.color,
-                    style.backgroundColor,
-                    style.borderColor,
-                  ].join(" ");
+                  if (
+                    rect.width < 6 ||
+                    rect.height < 6 ||
+                    rect.width > 24 ||
+                    rect.height > 24
+                  ) {
+                    return;
+                  }
 
-                const isRedWarning =
-                  /rgb\(\s*(220|225|239|248),\s*(38|50|68|75),\s*(38|47|55|60)\s*\)/i.test(
-                    colors
-                  ) ||
-                  /#dc2626|#ef4444|#f43f5e/i.test(
-                    colors
-                  );
+                  const style =
+                    getComputedStyle(
+                      candidate
+                    );
 
-                if (isRedWarning) {
-                  setHidden(
-                    candidate,
-                    true
-                  );
+                  if (
+                    containsRedColor(
+                      style
+                    )
+                  ) {
+                    setHidden(
+                      candidate,
+                      true
+                    );
+                  }
                 }
-              });
+              );
           });
       };
 
+      let refreshScheduled =
+        false;
+
+      const scheduleRefresh =
+        () => {
+          if (refreshScheduled) {
+            return;
+          }
+
+          refreshScheduled = true;
+
+          requestAnimationFrame(
+            () => {
+              refreshScheduled =
+                false;
+
+              refresh();
+            }
+          );
+        };
+
+      if (
+        this.typingMindWarningObserver
+      ) {
+        this.typingMindWarningObserver.disconnect();
+      }
+
+      if (
+        this.typingMindWarningTimer
+      ) {
+        clearInterval(
+          this.typingMindWarningTimer
+        );
+      }
+
       this.typingMindWarningObserver =
         new MutationObserver(
-          refresh
+          scheduleRefresh
         );
 
       this.typingMindWarningObserver.observe(
@@ -10273,21 +10482,26 @@ async download(key, isMetadata = false) {
           childList: true,
           subtree: true,
           attributes: true,
+
+          /*
+           * Do not observe style: this filter itself changes style and would
+           * otherwise trigger unnecessary observer cycles.
+           */
           attributeFilter: [
             "class",
-            "style",
             "aria-expanded",
+            "aria-hidden",
           ],
         }
       );
 
       this.typingMindWarningTimer =
         setInterval(
-          refresh,
-          15000
+          scheduleRefresh,
+          10000
         );
 
-      refresh();
+      scheduleRefresh();
     }
     
     notifyCloudChangesApplied(
@@ -11253,9 +11467,58 @@ async download(key, isMetadata = false) {
           backups.forEach((backup) => {
             const option = document.createElement("option");
             option.value = backup.key;
-            const total = backup.totalItems ?? "N/A";
-            const copied = backup.copiedItems ?? total;
-            const suffix = `(${copied}/${total})`;
+            const total =
+              backup.totalItems ?? 0;
+
+            const copied =
+              backup.copiedItems ??
+              total;
+
+            const hasAttachmentCounts =
+              Number.isFinite(
+                Number(
+                  backup.totalAttachments
+                )
+              );
+
+            const totalAttachments =
+              hasAttachmentCounts
+                ? Number(
+                    backup.totalAttachments
+                  )
+                : 0;
+
+            const copiedAttachments =
+              hasAttachmentCounts
+                ? Number(
+                    backup.copiedAttachments ??
+                      totalAttachments
+                  )
+                : 0;
+
+            const totalObjects =
+              backup.totalObjects ??
+              (
+                hasAttachmentCounts
+                  ? Number(total) +
+                    totalAttachments
+                  : total
+              );
+
+            const copiedObjects =
+              hasAttachmentCounts
+                ? Number(copied) +
+                  copiedAttachments
+                : copied;
+
+            const suffix =
+              `(${copiedObjects}/${totalObjects} objects)` +
+              (
+                hasAttachmentCounts
+                  ? ` [${copiedAttachments} attachments]`
+                  : ""
+              );
+
             let prefix = "";
             if (backup.type === "snapshot") {
               prefix = "📸 ";
